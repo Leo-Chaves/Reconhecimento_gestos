@@ -1,6 +1,6 @@
 # Theremin Gestual (`gestos-musicais`)
 
-Instrumento musical em tempo real via webcam usando **OpenCV**, **MediaPipe Hands**, **NumPy** e **Pygame Mixer**. Cada gesto da mão dispara uma nota da escala de **Dó Maior** sintetizada em memória (sem arquivos `.wav` externos), enquanto a altura do braço/punho controla continuamente o volume sonoro.
+Instrumento musical em tempo real via webcam usando **OpenCV**, **MediaPipe Hands**, **NumPy** e **Pygame Mixer**. Cada gesto da mão toca notas da escala de **Dó Maior** sintetizadas em memória (sem arquivos `.wav` externos), enquanto a altura do punho controla o volume e um avaliador musical reage às suas sequências exibindo **memes animados** na tela!
 
 ---
 
@@ -19,8 +19,6 @@ Instrumento musical em tempo real via webcam usando **OpenCV**, **MediaPipe Hand
 
 ## Configuração e Ativação da `.venv` (PowerShell)
 
-Entre na pasta `gestos-musicais`, crie o ambiente virtual isolado com Python 3.12, ative-o e instale as dependências:
-
 ```powershell
 cd gestos-musicais
 py -3.12 -m venv .venv
@@ -33,21 +31,24 @@ pip install -r requirements.txt
 
 ---
 
-## Execução
-
-Com a `.venv` ativada:
+## Execução e Atalhos ao Vivo
 
 ```powershell
 python main.py
 ```
 
-Para encerrar o programa a qualquer momento, pressione **`ESC`** ou **`q`**.
+| Tecla | Ação |
+| :---: | :--- |
+| **`1` / `2` / `3`** | Troca de timbre: **1 = Theremin Clássico (vibrato)**, **2 = Flauta Synth**, **3 = Retrô 8-bit** |
+| **`M`** | Alterna entre **Modo 1 Mão** (padrão) e **Modo 2 Mãos** |
+| **`C`** | Limpa a trilha de notas recentes |
+| **`ESC` ou `Q`** | Encerra a aplicação |
 
 ---
 
 ## Tabela de Gestos (Escala de Dó Maior)
 
-| Gesto da Mão | Nota | Frequência (Hz) | Observação |
+| Gesto da Mão | Nota | Frequência Base (Hz) | Observação |
 | :--- | :---: | :---: | :--- |
 | Apenas **Indicador** levantado | **DO** | 261.63 Hz | 1 dedo |
 | **Indicador + Médio** levantados | **RE** | 293.66 Hz | 2 dedos |
@@ -58,15 +59,25 @@ Para encerrar o programa a qualquer momento, pressione **`ESC`** ou **`q`**.
 | **Indicador + Mindinho** (gesto Rock) | **SI** | 493.88 Hz | 🤘 |
 | **Punho fechado** (nenhum dedo aberto) | **Silêncio** | — | Interrompe a nota suavemente |
 
-> **Estabilidade (Debounce):** Toda troca de gesto só é confirmada após **3 frames consecutivos** idênticos, evitando disparos acidentais durante transições rápidas entre dedos.
+> **Modo 2 Mãos (tecla `M`):** A **mão direita** continua escolhendo a nota, enquanto a **mão esquerda** controla o **volume pela altura do punho** e a **oitava** pela quantidade de dedos abertos (`0–1` dedo = Grave `-1`, `2–3` dedos = Normal `0`, `4–5` dedos = Aguda `+1`).
 
 ---
 
 ## Controle Dinâmico de Volume pela Altura do Braço
 
-O volume é modulado continuamente enquanto a nota está soando:
+1. **Coordenada do Punho:** Lê `landmarks[0].y` (`0.0` topo → `1.0` base).
+2. **Clamping e Mapeamento Linear:** Faixa útil de `y = 0.85` (**10%**) até `y = 0.15` (**100%**).
+3. **Suavização Exponencial (EMA):** `vol_suave = 0.7 * vol_suave + 0.3 * vol_bruto` evita oscilações bruscas por tremores da mão.
+4. **VU Meter:** A barra lateral acompanha em tempo real com gradiente **Verde → Amarelo → Vermelho**.
 
-1. **Captura da Altura:** O sistema lê a coordenada vertical normalizada do punho (`landmarks[0].y`, onde `0.0` é o topo da câmera e `1.0` é a base).
-2. **Faixa Útil e Clamping:** A região útil vai de `y = 0.85` (braço baixo → **10% / 0.10**) até `y = 0.15` (braço alto → **100% / 1.00**).
-3. **Suavização Exponencial (EMA):** Aplica-se `vol_suave = 0.7 * vol_suave + 0.3 * vol_bruto` a cada frame, eliminando variações bruscas causadas por tremores naturais da mão.
-4. **Modulação e VU Meter:** O volume calculado é aplicado em tempo real via `audio_engine.atualizar_volume(vol_suave)` e refletido na barra vertical **VU Meter** na lateral direita da tela (transição de **Verde → Amarelo → Vermelho**).
+---
+
+## Avaliador Musical e Memes (`assets/memes/`)
+
+Em **Modo Livre**, o módulo `music_evaluator.py` analisa as últimas 4–5 notas tocadas:
+- **Sequência Boa** (escalas como `DO → RE → MI → FA`, arpejos como `DO → MI → SOL`, melodias variadas) → Pop-up de **animal fofo** + fanfarra alegre!
+- **Sequência Ruim** (repetições robóticas como `DO → RE → DO → RE`, trítono `FA ↔ SI` ou saltos caóticos) → Pop-up de **gatinho triste** + efeito *"wah-wah"*!
+
+Você pode adicionar ou trocar as imagens livremente colocando arquivos `.png`, `.jpg` ou `.webp` nas pastas:
+- `assets/memes/good/`
+- `assets/memes/bad/`

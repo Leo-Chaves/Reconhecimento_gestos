@@ -1,20 +1,23 @@
-"""Theremin Gestual — Instrumento musical via webcam com controle dinâmico de volume.
+"""Theremin Gestual — Instrumento musical via webcam com memes, timbres e modo 2 mãos.
 
 Reconhece gestos geométricos da mão via MediaPipe Hands para tocar notas da
-escala de Dó Maior e modula a intensidade sonora continuamente conforme a altura
-vertical do punho na imagem da câmera.
+escala de Dó Maior, modula a intensidade sonora pela altura do punho, avalia
+sequências musicais em tempo real exibindo memes animados e suporta timbres
+selecionáveis e controle opcional com duas mãos.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Any, Sequence
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
 import audio_engine
+from meme_overlay import GerenciadorMemes
+from music_evaluator import AvaliadorMusical
 
 # Parâmetros de mapeamento da altura do punho para volume
 Y_TOPO: float = 0.15
@@ -68,12 +71,12 @@ def calcular_volume_por_altura(y_punho: float, vol_suave_anterior: float) -> flo
     return max(VOL_MIN, min(VOL_MAX, vol_suave))
 
 
-def _distancia_2d(lm_a: object, lm_b: object) -> float:
+def _distancia_2d(lm_a: Any, lm_b: Any) -> float:
     """Calcula a distância euclidiana normalizada 2D entre dois landmarks."""
     return math.hypot(lm_a.x - lm_b.x, lm_a.y - lm_b.y)
 
 
-def _polegar_aberto(landmarks: Sequence[object]) -> bool:
+def _polegar_aberto(landmarks: Sequence[Any]) -> bool:
     """Verifica se o polegar está estendido para fora da palma (ambidestro)."""
     dist_ponta_mindinho = _distancia_2d(landmarks[POLEGAR_TIP], landmarks[MINDINHO_MCP])
     dist_articulacao_mindinho = _distancia_2d(landmarks[POLEGAR_IP], landmarks[MINDINHO_MCP])
@@ -84,14 +87,8 @@ def _polegar_aberto(landmarks: Sequence[object]) -> bool:
     )
 
 
-def classificar_gesto(landmarks: Sequence[object]) -> tuple[bool, str | None]:
-    """Classifica os 21 landmarks em uma nota musical ou silêncio.
-
-    Returns:
-        Tupla ``(valido, nota)``, onde ``(True, None)`` representa punho fechado
-        (silêncio intencional) e ``(False, None)`` representa postura intermediária
-        não mapeada (ignorada pelo debounce).
-    """
+def classificar_gesto(landmarks: Sequence[Any]) -> tuple[bool, str | None]:
+    """Classifica os 21 landmarks em uma nota musical ou silêncio."""
     if _distancia_2d(landmarks[POLEGAR_TIP], landmarks[INDICADOR_TIP]) < LIMIAR_PINCA:
         return True, "LA"
 
@@ -109,18 +106,72 @@ def classificar_gesto(landmarks: Sequence[object]) -> tuple[bool, str | None]:
     return False, None
 
 
+def contar_dedos_abertos(landmarks: Sequence[Any]) -> int:
+    """Conta quantos dedos (0 a 5) estão estendidos na mão."""
+    abertos = sum(1 for tip, pip in PARES_DEDOS if landmarks[tip].y < landmarks[pip].y)
+    if _polegar_aberto(landmarks):
+        abertos += 1
+    return abertos
+
+
+def classificar_oitava(landmarks: Sequence[Any]) -> int:
+    """Mapeia quantidade de dedos da mão esquerda para oitava (-1, 0, +1)."""
+    dedos = contar_dedos_abertos(landmarks)
+    if dedos <= 1:
+        return -1
+    if dedos <= 3:
+        return 0
+    return 1
+
+
+def separar_maos_espelhadas(
+    maos_landmarks: Sequence[Any],
+    handedness_list: Sequence[Any] | None,
+) -> tuple[Any | None, Any | None]:
+    """Retorna ``(mao_direita_real, mao_esquerda_real)`` para imagem espelhada."""
+    if not maos_landmarks:
+        return None, None
+
+    if len(maos_landmarks) == 1:
+        rotulo = (
+            handedness_list[0].classification[0].label
+            if handedness_list and handedness_list[0].classification
+            else "Left"
+        )
+        # Em imagem espelhada (cv2.flip), "Left" do MediaPipe é a mão direita real
+        if rotulo == "Left":
+            return maos_landmarks[0], None
+        return None, maos_landmarks[0]
+
+    candidatos = []
+    for idx, hand_lm in enumerate(maos_landmarks[:2]):
+        rotulo = (
+            handedness_list[idx].classification[0].label
+            if handedness_list and idx < len(handedness_list) and handedness_list[idx].classification
+            else ""
+        )
+        candidatos.append((rotulo, hand_lm))
+
+    mao_dir = next((lm for rot, lm in candidatos if rot == "Left"), None)
+    mao_esq = next((lm for rot, lm in candidatos if rot == "Right"), None)
+
+    if mao_dir is None or mao_esq is None:
+        ordenado = sorted(maos_landmarks[:2], key=lambda h: h.landmark[PUNHO].x)
+        mao_esq, mao_dir = ordenado[0], ordenado[1]
+
+    return mao_dir, mao_esq
+
+
 def _cor_vu_meter(nivel: float) -> tuple[int, int, int]:
     """Interpola cor BGR de verde -> amarelo -> vermelho conforme o nível [0.1, 1.0]."""
     progresso = max(0.0, min(1.0, (nivel - VOL_MIN) / (VOL_MAX - VOL_MIN)))
     if progresso < 0.5:
         t = progresso * 2.0
-        # Verde (60, 220, 60) -> Amarelo (0, 225, 255)
         b = int(60 * (1.0 - t))
         g = int(220 + 5 * t)
         r = int(60 + 195 * t)
     else:
         t = (progresso - 0.5) * 2.0
-        # Amarelo (0, 225, 255) -> Vermelho (50, 60, 245)
         b = int(50 * t)
         g = int(225 * (1.0 - t) + 60 * t)
         r = int(255 - 10 * t)
@@ -132,127 +183,81 @@ def desenhar_hud(
     nota_atual: str | None,
     volume: float,
     mao_detectada: bool,
+    timbre: str = "theremin",
+    oitava: int = 0,
+    modo_duas_maos: bool = False,
+    trilha_notas: Sequence[str] = (),
 ) -> None:
-    """Renderiza painel superior informativo e barra vertical VU Meter para apresentação."""
+    """Renderiza painel superior, trilha de notas e VU Meter vertical."""
     altura, largura = frame.shape[:2]
 
-    # Painel superior translúcido
     altura_painel = 86
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (largura, altura_painel), (18, 20, 28), -1)
-    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+    cv2.addWeighted(overlay, 0.74, frame, 0.26, 0, frame)
     cv2.line(frame, (0, altura_painel), (largura, altura_painel), (70, 80, 100), 1)
 
     nome_nota = nota_atual if nota_atual is not None else "SILENCIO"
-    freq = audio_engine.NOTAS_FREQUENCIAS.get(nota_atual) if nota_atual else None
+    freq = (
+        audio_engine.NOTAS_FREQUENCIAS[nota_atual] * (2.0 ** oitava)
+        if nota_atual in audio_engine.NOTAS_FREQUENCIAS
+        else None
+    )
     texto_freq = f"{freq:.2f} Hz" if freq is not None else "-- Hz"
     percentual = int(round(volume * 100))
 
     cor_nota = (80, 235, 140) if nota_atual is not None else (160, 165, 180)
     cor_status = (60, 220, 90) if mao_detectada else (0, 175, 255)
 
-    # Indicador de detecção da mão
-    cv2.circle(frame, (26, 43), 8, cor_status, -1)
+    cv2.circle(frame, (22, 43), 8, cor_status, -1)
+    cv2.putText(frame, "NOTA", (42, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (175, 185, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, nome_nota, (42, 62), cv2.FONT_HERSHEY_SIMPLEX, 1.05, cor_nota, 2, cv2.LINE_AA)
+
+    x_freq = int(largura * 0.28)
+    cv2.putText(frame, "FREQUENCIA", (x_freq, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (175, 185, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, texto_freq, (x_freq, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (240, 244, 250), 2, cv2.LINE_AA)
+
+    x_cfg = int(largura * 0.54)
+    nome_timbre = audio_engine.NOMES_TIMBRES.get(timbre, timbre)
+    texto_oitava = f"{oitava:+d}" if oitava != 0 else "0"
+    texto_modo = "2 MAOS" if modo_duas_maos else "1 MAO"
+    cv2.putText(frame, f"TIMBRE | {texto_modo}", (x_cfg, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (175, 185, 200), 1, cv2.LINE_AA)
     cv2.putText(
         frame,
-        "NOTA",
-        (50, 26),
+        f"{nome_timbre} (8va {texto_oitava})",
+        (x_cfg, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (175, 185, 200),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        nome_nota,
-        (50, 64),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.15,
-        cor_nota,
+        0.58,
+        (255, 215, 110),
         2,
         cv2.LINE_AA,
     )
 
-    # Frequência (Hz)
-    x_freq = int(largura * 0.36)
-    cv2.putText(
-        frame,
-        "FREQUENCIA",
-        (x_freq, 26),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (175, 185, 200),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        texto_freq,
-        (x_freq, 64),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.95,
-        (240, 244, 250),
-        2,
-        cv2.LINE_AA,
-    )
-
-    # Intensidade (%)
-    x_vol = int(largura * 0.68)
+    x_vol = int(largura * 0.82)
     cor_vol = _cor_vu_meter(volume)
-    cv2.putText(
-        frame,
-        "INTENSIDADE",
-        (x_vol, 26),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (175, 185, 200),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        f"{percentual:3d}%",
-        (x_vol, 64),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.05,
-        cor_vol,
-        2,
-        cv2.LINE_AA,
-    )
+    cv2.putText(frame, "VOLUME", (x_vol, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (175, 185, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"{percentual:3d}%", (x_vol, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.92, cor_vol, 2, cv2.LINE_AA)
 
     # Barra vertical VU Meter na lateral direita
-    vu_largura = 32
-    vu_x2 = largura - 24
+    vu_largura = 30
+    vu_x2 = largura - 20
     vu_x1 = vu_x2 - vu_largura
-    vu_y1 = altura_painel + 36
-    vu_y2 = altura - 54
+    vu_y1 = altura_painel + 34
+    vu_y2 = altura - 66
 
     overlay_vu = frame.copy()
-    cv2.rectangle(overlay_vu, (vu_x1 - 12, vu_y1 - 24), (vu_x2 + 10, vu_y2 + 28), (18, 20, 28), -1)
+    cv2.rectangle(overlay_vu, (vu_x1 - 12, vu_y1 - 24), (vu_x2 + 10, vu_y2 + 26), (18, 20, 28), -1)
     cv2.addWeighted(overlay_vu, 0.65, frame, 0.35, 0, frame)
 
-    cv2.putText(
-        frame,
-        "VOL",
-        (vu_x1 - 2, vu_y1 - 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        (210, 218, 230),
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Fundo interno da barra
+    cv2.putText(frame, "VOL", (vu_x1 - 2, vu_y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (210, 218, 230), 1, cv2.LINE_AA)
     cv2.rectangle(frame, (vu_x1, vu_y1), (vu_x2, vu_y2), (45, 50, 62), -1)
 
-    # Preenchimento proporcional de baixo para cima em segmentos coloridos
     altura_barra = vu_y2 - vu_y1
     progresso = max(0.0, min(1.0, (volume - VOL_MIN) / (VOL_MAX - VOL_MIN)))
     altura_preenchida = int(round(altura_barra * (0.10 + 0.90 * progresso)))
     topo_preenchido = vu_y2 - altura_preenchida
 
-    num_segmentos = 24
+    num_segmentos = 22
     espaco = 2
     alt_seg = max(2, (altura_barra - (num_segmentos - 1) * espaco) // num_segmentos)
     for idx in range(num_segmentos):
@@ -264,24 +269,19 @@ def desenhar_hud(
         cv2.rectangle(frame, (vu_x1 + 3, seg_y1), (vu_x2 - 3, seg_y2), _cor_vu_meter(nivel_seg), -1)
 
     cv2.rectangle(frame, (vu_x1, vu_y1), (vu_x2, vu_y2), (130, 140, 160), 1)
-    cv2.putText(
-        frame,
-        f"{percentual}%",
-        (vu_x1 - 4, vu_y2 + 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        cor_vol,
-        1,
-        cv2.LINE_AA,
-    )
+    cv2.putText(frame, f"{percentual}%", (vu_x1 - 4, vu_y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, cor_vol, 1, cv2.LINE_AA)
 
-    # Rodapé discreto
+    # Trilha visual das últimas notas tocadas
+    if trilha_notas:
+        trilha_str = "Trilha: " + " -> ".join(trilha_notas)
+        cv2.putText(frame, trilha_str, (16, altura - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (125, 225, 255), 1, cv2.LINE_AA)
+
     cv2.putText(
         frame,
-        "ESC ou Q: Sair  |  Altura do punho: Volume  |  Punho fechado: Silencio",
-        (16, altura - 16),
+        "1-3: Timbre | M: Modo 2 Maos | C: Limpar Trilha | ESC/Q: Sair",
+        (16, altura - 14),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
+        0.47,
         (210, 215, 225),
         1,
         cv2.LINE_AA,
@@ -291,6 +291,8 @@ def desenhar_hud(
 def executar() -> None:
     """Executa o loop principal de captura de vídeo, detecção e síntese sonora."""
     audio_engine.inicializar_audio()
+    avaliador = AvaliadorMusical()
+    memes = GerenciadorMemes()
 
     captura = cv2.VideoCapture(0)
     if not captura.isOpened():
@@ -307,11 +309,12 @@ def executar() -> None:
     nota_atual: str | None = None
     candidato_estado: str | None = None
     contador_debounce: int = 0
+    modo_duas_maos = False
 
     try:
         with mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
+            max_num_hands=2,
             min_detection_confidence=0.75,
             min_tracking_confidence=0.75,
         ) as hands:
@@ -326,27 +329,37 @@ def executar() -> None:
                 resultado = hands.process(frame_rgb)
                 frame_rgb.flags.writeable = True
 
-                mao_detectada = bool(resultado.multi_hand_landmarks)
-                estado_valido = False
-                proximo_estado: str | None = None
-
-                if mao_detectada:
-                    hand_landmarks = resultado.multi_hand_landmarks[0]
+                maos = resultado.multi_hand_landmarks or []
+                mao_detectada = len(maos) > 0
+                for hand_lm in maos:
                     mp_desenho.draw_landmarks(
                         frame,
-                        hand_landmarks,
+                        hand_lm,
                         mp_hands.HAND_CONNECTIONS,
                         mp_estilos.get_default_hand_landmarks_style(),
                         mp_estilos.get_default_hand_connections_style(),
                     )
 
-                    landmarks = hand_landmarks.landmark
-                    vol_suave = calcular_volume_por_altura(landmarks[PUNHO].y, vol_suave)
-                    audio_engine.atualizar_volume(vol_suave)
+                estado_valido = False
+                proximo_estado: str | None = None
 
-                    estado_valido, proximo_estado = classificar_gesto(landmarks)
+                if mao_detectada:
+                    if modo_duas_maos:
+                        mao_dir, mao_esq = separar_maos_espelhadas(maos, resultado.multi_handedness)
+                        if mao_esq is not None:
+                            vol_suave = calcular_volume_por_altura(mao_esq.landmark[PUNHO].y, vol_suave)
+                            audio_engine.atualizar_volume(vol_suave)
+                            audio_engine.definir_oitava(classificar_oitava(mao_esq.landmark))
+                        if mao_dir is not None:
+                            estado_valido, proximo_estado = classificar_gesto(mao_dir.landmark)
+                        else:
+                            estado_valido, proximo_estado = True, None
+                    else:
+                        landmarks = maos[0].landmark
+                        vol_suave = calcular_volume_por_altura(landmarks[PUNHO].y, vol_suave)
+                        audio_engine.atualizar_volume(vol_suave)
+                        estado_valido, proximo_estado = classificar_gesto(landmarks)
                 else:
-                    # Sem mão no quadro: confirma transição para silêncio após debounce
                     estado_valido = True
                     proximo_estado = None
 
@@ -363,13 +376,36 @@ def executar() -> None:
                             audio_engine.parar_nota()
                         else:
                             audio_engine.tocar_nota(nota_atual, vol_suave)
+                            avaliacao = avaliador.registrar_nota(nota_atual)
+                            if avaliacao is not None and avaliacao.categoria is not None:
+                                memes.ativar(avaliacao.categoria, avaliacao.motivo)
+                                audio_engine.tocar_sfx_meme(avaliacao.categoria)
 
-                desenhar_hud(frame, nota_atual, vol_suave, mao_detectada)
+                timbre_atual, oitava_atual = audio_engine.obter_estado_audio()
+                desenhar_hud(
+                    frame,
+                    nota_atual,
+                    vol_suave,
+                    mao_detectada,
+                    timbre=timbre_atual,
+                    oitava=oitava_atual,
+                    modo_duas_maos=modo_duas_maos,
+                    trilha_notas=avaliador.historico,
+                )
+                memes.renderizar(frame)
                 cv2.imshow("Theremin Gestual - Dó Maior", frame)
 
                 tecla = cv2.waitKey(1) & 0xFF
                 if tecla in (27, ord("q"), ord("Q")):
                     break
+                if tecla in (ord("1"), ord("2"), ord("3")):
+                    audio_engine.definir_timbre(tecla - ord("0"))
+                elif tecla in (ord("m"), ord("M")):
+                    modo_duas_maos = not modo_duas_maos
+                    if not modo_duas_maos:
+                        audio_engine.definir_oitava(0)
+                elif tecla in (ord("c"), ord("C")):
+                    avaliador.limpar()
     finally:
         captura.release()
         cv2.destroyAllWindows()
