@@ -1,0 +1,20 @@
+# Ambientes virtuais Python
+.venv/
+**/.venv/
+venv/
+env/
+
+# Cache e artefatos Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# IDEs e Sistema Operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
