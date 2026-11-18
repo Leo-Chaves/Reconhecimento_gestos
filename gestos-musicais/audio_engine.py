@@ -10,6 +10,7 @@ Sintetiza em memória via NumPy (sem arquivos externos):
 
 from __future__ import annotations
 
+import random
 from typing import Literal
 
 import numpy as np
@@ -109,6 +110,25 @@ NOMES_TIMBRES: dict[str, str] = {
 MODOS_HARMONICOS: tuple[ModoHarmonico, ...] = ("acorde", "nota")
 ESCALAS_VALIDAS: tuple[TipoEscala, ...] = ("maior", "menor")
 
+# Padrões musicais do Arpejador (índices sobre os 4 graus do acorde: 0=Tônica, 1=3ª, 2=5ª, 3=8ª)
+PADROES_ARPEJO: tuple[str, ...] = ("sobe", "sobe_desce", "violao", "indie", "livre")
+NOMES_PADROES_ARPEJO: dict[str, str] = {
+    "sobe": "Sobe",
+    "sobe_desce": "Vai-Vem",
+    "violao": "Violao",
+    "indie": "Indie",
+    "livre": "Livre",
+}
+SEQUENCIAS_GRAUS_ARPEJO: dict[str, tuple[int, ...]] = {
+    "sobe": (0, 1, 2, 3),
+    "sobe_desce": (0, 1, 2, 3, 2, 1),
+    "violao": (0, 2, 1, 3, 2, 1),
+    "indie": (0, 1, 2, 3, 2, 1, 2, 1),
+}
+DINAMICAS_ARPEJO: dict[str, tuple[float, ...]] = {
+    "indie": (1.00, 0.72, 0.80, 0.92, 0.78, 0.70, 0.78, 0.70),
+}
+
 _PESOS_TRIADE: tuple[float, float, float] = (0.46, 0.29, 0.25)
 _TAPS_REVERB_ESQ: tuple[tuple[int, float], ...] = ((1367, 0.22), (2903, 0.14), (4721, 0.08))
 _TAPS_REVERB_DIR: tuple[tuple[int, float], ...] = ((1693, 0.22), (3371, 0.14), (5237, 0.08))
@@ -136,6 +156,9 @@ _arpejo_ativo_vivo: bool = False
 _volume_atual_vivo: float = 0.75
 _timbre_atual: str = "piano"
 _modo_harmonico_atual: ModoHarmonico = "acorde"
+_padrao_arpejo_atual: str = "sobe"
+_ultimo_grau_livre_vivo: int = -1
+_ultimo_grau_livre_looper: int = -1
 
 
 def _limitar_volume(volume: float) -> float:
@@ -460,6 +483,31 @@ def obter_estado_audio() -> tuple[str, ModoHarmonico]:
     return _timbre_atual, _modo_harmonico_atual
 
 
+def alternar_padrao_arpejo() -> str:
+    """Avança para o próximo padrão rítmico/melódico do Arpejador."""
+    global _padrao_arpejo_atual
+
+    idx = PADROES_ARPEJO.index(_padrao_arpejo_atual)
+    _padrao_arpejo_atual = PADROES_ARPEJO[(idx + 1) % len(PADROES_ARPEJO)]
+    return _padrao_arpejo_atual
+
+
+def definir_padrao_arpejo(padrao: str) -> str:
+    """Define explicitamente o padrão ativo do Arpejador."""
+    global _padrao_arpejo_atual
+
+    chave = padrao.lower()
+    if chave not in PADROES_ARPEJO:
+        raise ValueError(f"Padrão inválido '{padrao}'. Opções: {PADROES_ARPEJO}")
+    _padrao_arpejo_atual = chave
+    return _padrao_arpejo_atual
+
+
+def obter_padrao_arpejo() -> str:
+    """Retorna a chave do padrão ativo do Arpejador."""
+    return _padrao_arpejo_atual
+
+
 def atualizar_volume(volume: float, canal_looper: bool = False) -> None:
     """Atualiza em tempo real o volume do canal sustentado ativo."""
     global _volume_atual_vivo
@@ -571,33 +619,60 @@ def disparar_passo_arpejo(
     volume: float = 0.75,
     timbre_override: str | None = None,
     canal_looper: bool = False,
-) -> int:
-    """Dispara a próxima nota dedilhada do arpejo e retorna o próximo índice."""
+    padrao_override: str | None = None,
+) -> tuple[int, int]:
+    """Dispara a próxima nota dedilhada do arpejo e retorna ``(proximo_passo, grau_tocado)``."""
+    global _ultimo_grau_livre_vivo, _ultimo_grau_livre_looper
+
     inicializar_audio()
     chave = nota.upper()
     if chave not in NOTAS_FREQUENCIAS:
-        return 0
+        return 0, 0
 
     vol = _limitar_volume(volume)
     timbre_efetivo = (timbre_override or _timbre_atual).lower()
     if timbre_efetivo not in TIMBRES:
         timbre_efetivo = _timbre_atual
 
+    padrao_efetivo = (padrao_override or _padrao_arpejo_atual).lower()
+    if padrao_efetivo not in PADROES_ARPEJO:
+        padrao_efetivo = _padrao_arpejo_atual
+
+    if padrao_efetivo == "livre":
+        anterior = _ultimo_grau_livre_looper if canal_looper else _ultimo_grau_livre_vivo
+        opcoes = [g for g in (0, 1, 2, 3) if g != anterior]
+        grau = random.choice(opcoes)
+        if canal_looper:
+            _ultimo_grau_livre_looper = grau
+        else:
+            _ultimo_grau_livre_vivo = grau
+        proximo_passo = (passo + 1) % 8
+        dinamica = 0.92 if (passo % 4 == 0) else 0.85
+    else:
+        seq = SEQUENCIAS_GRAUS_ARPEJO[padrao_efetivo]
+        idx = passo % len(seq)
+        grau = seq[idx]
+        proximo_passo = (idx + 1) % len(seq)
+        if padrao_efetivo in DINAMICAS_ARPEJO:
+            dinamica = DINAMICAS_ARPEJO[padrao_efetivo][idx]
+        else:
+            dinamica = 1.0 if idx == 0 else 0.88
+
     if _modo_harmonico_atual == "acorde":
         midi_base = NOTAS_MIDI[chave]
         terca = 4 if escala == "maior" else 3
         intervalos = (0, terca, 7, 12)
+        midi_alvo = midi_base + intervalos[grau]
     else:
         midi_base = NOTAS_MIDI[chave] if escala == "maior" else NOTAS_MIDI_MENOR_NATURAL[chave]
-        intervalos = (0, 12)
+        midi_alvo = midi_base + (0 if grau < 2 else 12)
 
-    idx = passo % len(intervalos)
-    midi_alvo = max(60, min(84, midi_base + intervalos[idx]))
+    midi_alvo = max(60, min(84, midi_alvo))
     som = _sons_plucked.get((timbre_efetivo, midi_alvo))
     if som is not None:
-        _disparar_plucked_no_pool(som, vol, canal_looper)
+        _disparar_plucked_no_pool(som, max(0.08, vol * dinamica), canal_looper)
 
-    return (idx + 1) % len(intervalos)
+    return proximo_passo, grau
 
 
 def parar_nota(canal_looper: bool = False) -> None:

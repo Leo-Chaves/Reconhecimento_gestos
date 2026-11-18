@@ -146,6 +146,7 @@ def executar() -> None:
     touch_aereo = GerenciadorTouchAereo()
     looper = MiniLooper()
     memes = SistemaParticulasMemes()
+    faiscas_corda = ui_renderer.SistemaFaiscasCorda()
 
     captura = cv2.VideoCapture(0)
     if not captura.isOpened():
@@ -175,6 +176,7 @@ def executar() -> None:
     escala_tocando: TipoEscala = "maior"
     arpejo_tocando: bool = False
     passo_arpejo: int = 0
+    grau_ativo_arpejo: int = 0
     ultimo_pulso_arpejo: float = 0.0
     proximo_pulso_arpejo: float = 0.0
 
@@ -183,10 +185,13 @@ def executar() -> None:
     botoes_ui: list[BotaoUI] = []
 
     def _executar_acao_ui(acao: str, agora_ev: float, vol_ev: float, arp_ev: bool) -> None:
-        nonlocal mostrar_guia
+        nonlocal mostrar_guia, passo_arpejo
         if acao.startswith("timbre:"):
             indice = int(acao.split(":")[1])
             audio_engine.definir_timbre(indice)
+        elif acao == "arpejo:padrao":
+            audio_engine.alternar_padrao_arpejo()
+            passo_arpejo = 0
         elif acao == "looper:toggle":
             tim_atual, _ = audio_engine.obter_estado_audio()
             looper.alternar(
@@ -257,6 +262,8 @@ def executar() -> None:
                 )
 
                 timbre_atual, modo_harmonico_atual = audio_engine.obter_estado_audio()
+                padrao_arpejo_atual = audio_engine.obter_padrao_arpejo()
+                disparou_pulso_frame = False
 
                 if nota_confirmada is not None:
                     mudou_nota = nota_confirmada != nota_tocando
@@ -286,7 +293,7 @@ def executar() -> None:
 
                         if agora >= proximo_pulso_arpejo:
                             passo_usado = passo_arpejo
-                            passo_arpejo = audio_engine.disparar_passo_arpejo(
+                            passo_arpejo, grau_ativo_arpejo = audio_engine.disparar_passo_arpejo(
                                 nota_confirmada,
                                 escala=estado_maos.escala,
                                 passo=passo_usado,
@@ -299,9 +306,11 @@ def executar() -> None:
                                 passo_usado,
                                 estado_maos.volume,
                                 agora,
+                                padrao_arpejo=padrao_arpejo_atual,
                             )
                             ultimo_pulso_arpejo = agora
                             proximo_pulso_arpejo = agora + (1.0 / max(1.0, estado_maos.taxa_arpejo_hz))
+                            disparou_pulso_frame = True
                     else:
                         if mudou_nota or mudou_escala or mudou_modo_arp:
                             audio_engine.tocar_nota(
@@ -340,7 +349,7 @@ def executar() -> None:
 
                 ui_renderer.desenhar_maos(frame, estado_maos.maos_visuais)
                 if estado_maos.modo_duas_maos and estado_maos.arpejo_ativo:
-                    ui_renderer.desenhar_corda_arpejo(
+                    nos_corda = ui_renderer.desenhar_corda_arpejo(
                         frame,
                         estado_maos.ponto_palma_esq,
                         estado_maos.ponto_palma_dir,
@@ -348,7 +357,14 @@ def executar() -> None:
                         nota_tocando,
                         agora - ultimo_pulso_arpejo,
                         agora,
+                        grau_ativo=grau_ativo_arpejo,
                     )
+                    if disparou_pulso_frame and nos_corda:
+                        nx_px, ny_px = nos_corda[grau_ativo_arpejo % len(nos_corda)]
+                        cor_faisca = (145, 250, 190) if estado_maos.escala == "maior" else (255, 215, 125)
+                        faiscas_corda.emitir(nx_px, ny_px, cor_faisca, quantidade=7, agora=agora)
+
+                faiscas_corda.atualizar_e_renderizar(frame, agora=agora)
                 memes.atualizar_e_renderizar(frame, agora=agora)
 
                 botoes_ui = ui_renderer.desenhar_hud(
@@ -362,6 +378,7 @@ def executar() -> None:
                     mostrar_guia=mostrar_guia,
                     botao_hover_id=hover_id,
                     progresso_hover=prog_hover,
+                    padrao_arpejo=padrao_arpejo_atual,
                 )
 
                 cv2.imshow(TITULO_JANELA, frame)
@@ -371,6 +388,8 @@ def executar() -> None:
                     break
                 if tecla in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
                     audio_engine.definir_timbre(tecla - ord("0"))
+                elif tecla in (ord("a"), ord("A")):
+                    _executar_acao_ui("arpejo:padrao", agora, estado_maos.volume, estado_maos.arpejo_ativo)
                 elif tecla in (ord("h"), ord("H")):
                     audio_engine.alternar_modo_harmonico()
                 elif tecla in (ord("g"), ord("G")):

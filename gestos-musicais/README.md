@@ -19,6 +19,7 @@ python main.py
 | Tecla / Botão | Ação |
 | :---: | :--- |
 | **`1` a `5`** *(ou Touch/Clique no topo)* | Troca instrumento: **1 Piano**, **2 Violão**, **3 Cordas**, **4 Synth**, **5 8-Bit** |
+| **`A`** *(ou Touch/Clique em `ARP:...`)* | Alterna o padrão do Arpejador: **Sobe**, **Vai-Vem**, **Violão**, **Indie** (8 tempos) e **Livre** |
 | **`R`** *(ou Touch/Clique em `LOOP`)* | **Mini-Looper**: `Parado → Gravando → Loop Contínuo → Limpar` |
 | **`G`** *(ou Touch/Clique em `?`)* | Abre ou fecha o **Guia Visual de Gestos** (oculto por padrão para tela limpa) |
 | **`F`** | Alterna entre janela redimensionável e **Tela Cheia** |
@@ -36,7 +37,7 @@ python main.py
   - **Mão Esquerda:** escolhe a nota (`DO4` a `DO5`) ou `Silêncio` (punho fechado).
   - **Mão Direita — Altura (`Y`):** controla o **volume** (`10%` a `100%`).
   - **Mão Direita — Postura:** **Palma aberta** (`>= 3` dedos) = **MAIOR** *(verde + gatos felizes)*; **Punho fechado ou Pinça** = **MENOR** *(azul + gatos tristes)* sem cortar a nota.
-  - **Aproximar as duas mãos (eixo `X`):** ativa o **Arpejador automático** com uma corda luminosa vibrante entre as palmas (`4.5` a `9.5` notas/s quanto mais próximas).
+  - **Aproximar as duas mãos (eixo `X`):** ativa o **Arpejador automático** com uma corda luminosa de 4 nós (Tônica, 3ª, 5ª e 8ª) entre as palmas, acendendo o nó tocado com faíscas (`4.5` a `9.5` notas/s quanto mais próximas). No padrão **Indie**, experimente a progressão `DO4 MAIOR → MI4 MAIOR → FA4 MAIOR → FA4 MENOR` em **`2 Violao`**!
 
 ### Tabela das 8 Notas
 

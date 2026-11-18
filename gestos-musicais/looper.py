@@ -30,6 +30,7 @@ class EventoLoop:
     volume: float = 0.75
     arpejo: bool = False
     passo: int = 0
+    padrao_arpejo: str = "sobe"
 
 
 class MiniLooper:
@@ -131,6 +132,7 @@ class MiniLooper:
         passo: int,
         volume: float,
         agora: float,
+        padrao_arpejo: str = "sobe",
     ) -> None:
         """Registra um passo dedilhado do arpejador durante a gravação."""
         if self.estado != "gravando":
@@ -145,6 +147,7 @@ class MiniLooper:
                 volume=volume,
                 arpejo=True,
                 passo=passo,
+                padrao_arpejo=padrao_arpejo,
             )
         )
 
@@ -173,6 +176,7 @@ class MiniLooper:
                 volume=vol_base,
                 timbre_override=ev.timbre,
                 canal_looper=True,
+                padrao_override=ev.padrao_arpejo,
             )
             return
         audio_engine.tocar_nota(

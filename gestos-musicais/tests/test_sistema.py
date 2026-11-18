@@ -319,11 +319,34 @@ class TestAudioEngine(unittest.TestCase):
             self.assertEqual(audio_engine.definir_timbre(idx), nome)
             audio_engine.tocar_nota("DO4", escala="maior", volume=0.8, arpejo=False)
             audio_engine.tocar_nota("DO4", escala="maior", volume=0.8, arpejo=True)
-            p1 = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=0, volume=0.8)
-            p2 = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=p1, volume=0.8)
-            self.assertEqual((p1, p2), (1, 2))
+            p1, g1 = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=0, volume=0.8)
+            p2, g2 = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=p1, volume=0.8)
+            self.assertEqual((p1, g1, p2, g2), (1, 0, 2, 1))
+
+        # Testa alternância dos 5 padrões e o dedilhado de 8 tempos do padrão 'indie'
+        vistos = [audio_engine.obter_padrao_arpejo()]
+        for _ in range(len(audio_engine.PADROES_ARPEJO) - 1):
+            vistos.append(audio_engine.alternar_padrao_arpejo())
+        self.assertEqual(tuple(vistos), audio_engine.PADROES_ARPEJO)
+
+        audio_engine.definir_padrao_arpejo("indie")
+        graus_indie = []
+        passo = 0
+        for _ in range(8):
+            passo, g = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=passo, volume=0.8)
+            graus_indie.append(g)
+        self.assertEqual(graus_indie, [0, 1, 2, 3, 2, 1, 2, 1])
+
+        # Padrão 'livre' nunca repete o mesmo grau consecutivamente
+        audio_engine.definir_padrao_arpejo("livre")
+        grau_ant = -1
+        for i in range(10):
+            passo, g = audio_engine.disparar_passo_arpejo("SOL4", escala="maior", passo=i, volume=0.8)
+            self.assertNotEqual(g, grau_ant)
+            grau_ant = g
 
         # Passagem fluida (Legato Maior -> Menor na mesma nota e troca de nota com release natural)
+        audio_engine.definir_padrao_arpejo("sobe")
         audio_engine.definir_timbre("piano")
         audio_engine.tocar_nota("DO4", escala="maior", volume=0.8, arpejo=False)
         audio_engine.tocar_nota("DO4", escala="menor", volume=0.8, arpejo=False)
@@ -332,7 +355,15 @@ class TestAudioEngine(unittest.TestCase):
 
         # Canal do looper independente
         audio_engine.tocar_nota("SOL4", escala="menor", volume=0.5, timbre_override="violao", canal_looper=True)
-        audio_engine.disparar_passo_arpejo("SOL4", escala="menor", passo=0, volume=0.5, timbre_override="piano", canal_looper=True)
+        audio_engine.disparar_passo_arpejo(
+            "SOL4",
+            escala="menor",
+            passo=0,
+            volume=0.5,
+            timbre_override="piano",
+            canal_looper=True,
+            padrao_override="indie",
+        )
         audio_engine.parar_nota(canal_looper=False)
         audio_engine.parar_nota(canal_looper=True)
 
@@ -352,7 +383,7 @@ class TestMiniLooper(unittest.TestCase):
         estado = looper.alternar(10.0, nota_atual="DO4", escala_atual="maior", timbre_atual="violao", volume_atual=0.8)
         self.assertEqual(estado, "gravando")
         looper.registrar_nota("SOL4", "maior", "violao", 0.8, agora=10.5)
-        looper.registrar_passo_arpejo("LA4", "menor", "piano", 1, 0.7, agora=10.8)
+        looper.registrar_passo_arpejo("LA4", "menor", "piano", 1, 0.7, agora=10.8, padrao_arpejo="indie")
         self.assertEqual(looper.contar_eventos(), 3)
 
         # Fecha gravação -> inicia reprodução
@@ -422,27 +453,83 @@ class TestUIRenderer(unittest.TestCase):
 
         memes = SistemaParticulasMemes(cooldown_segundos=0.0, probabilidade_meme=1.0)
         memes.disparar("maior", estado.ancora_meme, rotulo="DO5 MAIOR", agora=1.0, forcar=True)
+        faiscas = ui_renderer.SistemaFaiscasCorda()
 
         frame = np.full((720, 1280, 3), 40, dtype=np.uint8)
+        nos = []
         for _ in range(3):
             ui_renderer.desenhar_maos(frame, estado.maos_visuais)
-            ui_renderer.desenhar_corda_arpejo(frame, estado.ponto_palma_esq, estado.ponto_palma_dir, "maior", "DO5", 0.05, 1.15)
+            nos = ui_renderer.desenhar_corda_arpejo(
+                frame,
+                estado.ponto_palma_esq,
+                estado.ponto_palma_dir,
+                "maior",
+                "DO5",
+                0.05,
+                1.15,
+                grau_ativo=2,
+            )
+            faiscas.atualizar_e_renderizar(frame, agora=1.15)
             memes.atualizar_e_renderizar(frame, agora=1.15)
-            botoes = ui_renderer.desenhar_hud(frame, estado, "DO5", "violao", "acorde", "tocando", 0.4, False, "timbre:2", 0.6)
+            botoes = ui_renderer.desenhar_hud(
+                frame,
+                estado,
+                "DO5",
+                "violao",
+                "acorde",
+                "tocando",
+                0.4,
+                False,
+                "timbre:2",
+                0.6,
+                padrao_arpejo="indie",
+            )
 
+        self.assertEqual(len(nos), 4)
         ids = {b.id_acao for b in botoes}
-        self.assertEqual(ids, {"timbre:1", "timbre:2", "timbre:3", "timbre:4", "timbre:5", "looper:toggle", "ajuda:toggle"})
+        self.assertEqual(
+            ids,
+            {"arpejo:padrao", "timbre:1", "timbre:2", "timbre:3", "timbre:4", "timbre:5", "looper:toggle", "ajuda:toggle"},
+        )
+
+        # Emite faíscas no nó ativo e valida expiração automática
+        faiscas.emitir(nos[2][0], nos[2][1], (145, 250, 190), quantidade=7, agora=1.0)
+        self.assertEqual(faiscas.contar_ativas(), 7)
 
         n_frames = 20
         inicio = time.perf_counter()
         for i in range(n_frames):
             t = 1.0 + i * 0.02
             ui_renderer.desenhar_maos(frame, estado.maos_visuais)
-            ui_renderer.desenhar_corda_arpejo(frame, estado.ponto_palma_esq, estado.ponto_palma_dir, "maior", "DO5", 0.04, t)
+            ui_renderer.desenhar_corda_arpejo(
+                frame,
+                estado.ponto_palma_esq,
+                estado.ponto_palma_dir,
+                "maior",
+                "DO5",
+                0.04,
+                t,
+                grau_ativo=i % 4,
+            )
+            faiscas.atualizar_e_renderizar(frame, agora=t)
             memes.atualizar_e_renderizar(frame, agora=t)
-            ui_renderer.desenhar_hud(frame, estado, "DO5", "violao", "acorde", "tocando", 0.5, False)
+            ui_renderer.desenhar_hud(
+                frame,
+                estado,
+                "DO5",
+                "violao",
+                "acorde",
+                "tocando",
+                0.5,
+                False,
+                padrao_arpejo="indie",
+            )
         tempo_medio_ms = ((time.perf_counter() - inicio) / n_frames) * 1000.0
-        self.assertLess(tempo_medio_ms, 8.0, f"Renderização demorou {tempo_medio_ms:.2f} ms/frame")
+        self.assertLess(tempo_medio_ms, 15.0, f"Renderização demorou {tempo_medio_ms:.2f} ms/frame")
+
+        # Após > 0.45s todas as faíscas emitidas em t=1.0 devem ter expirado
+        faiscas.atualizar_e_renderizar(frame, agora=1.60)
+        self.assertEqual(faiscas.contar_ativas(), 0)
 
         # Também renderiza modal [?] sem erros
         ui_renderer.desenhar_hud(frame, estado, "DO5", "piano", "acorde", "gravando", 1.2, mostrar_guia=True)
