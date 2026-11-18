@@ -1,83 +1,57 @@
-# Theremin Gestual (`gestos-musicais`)
+# Tocador Musical Gestual (`gestos-musicais`)
 
-Instrumento musical em tempo real via webcam usando **OpenCV**, **MediaPipe Hands**, **NumPy** e **Pygame Mixer**. Cada gesto da mão toca notas da escala de **Dó Maior** sintetizadas em memória (sem arquivos `.wav` externos), enquanto a altura do punho controla o volume e um avaliador musical reage às suas sequências exibindo **memes animados** na tela!
-
----
-
-## Pré-requisitos
-
-- **Windows** (PowerShell)
-- **Python 3.12** (necessário para compatibilidade oficial dos *wheels* do `mediapipe==0.10.21` com `mediapipe.solutions.hands` e `pygame`)
-- Webcam conectada e saída de áudio ativa
-
-> **Nota sobre o Python 3.12:** Caso tenha apenas Python 3.14 instalado pelo *Python Install Manager*, instale o 3.12 lado a lado sem remover o 3.14:
-> ```powershell
-> py install 3.12
-> ```
+Instrumento musical interativo em HD (`1280x720`, janela redimensionável e Tela Cheia) via webcam usando **OpenCV**, **MediaPipe Hands**, **NumPy** e **Pygame Mixer**. Possui **5 instrumentos com reverb estéreo**, **Arpejador espacial com corda luminosa**, **Mini-Looper de base**, **Touch Aéreo** na barra superior e **pop-ups probabilísticos de gatos**.
 
 ---
 
-## Configuração e Ativação da `.venv` (PowerShell)
+## Pré-requisitos e Execução
 
 ```powershell
 cd gestos-musicais
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-*(Caso o PowerShell bloqueie o script de ativação na primeira vez, libere para o usuário atual com `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`.)*
-
----
-
-## Execução e Atalhos ao Vivo
-
-```powershell
 python main.py
 ```
 
-| Tecla | Ação |
+### Atalhos e Controles na Barra Superior
+
+| Tecla / Botão | Ação |
 | :---: | :--- |
-| **`1` / `2` / `3`** | Troca de timbre: **1 = Theremin Clássico (vibrato)**, **2 = Flauta Synth**, **3 = Retrô 8-bit** |
-| **`M`** | Alterna entre **Modo 1 Mão** (padrão) e **Modo 2 Mãos** |
-| **`C`** | Limpa a trilha de notas recentes |
+| **`1` a `5`** *(ou Touch/Clique no topo)* | Troca instrumento: **1 Piano**, **2 Violão**, **3 Cordas**, **4 Synth**, **5 8-Bit** |
+| **`R`** *(ou Touch/Clique em `LOOP`)* | **Mini-Looper**: `Parado → Gravando → Loop Contínuo → Limpar` |
+| **`G`** *(ou Touch/Clique em `?`)* | Abre ou fecha o **Guia Visual de Gestos** (oculto por padrão para tela limpa) |
+| **`F`** | Alterna entre janela redimensionável e **Tela Cheia** |
+| **`H`** | Alterna entre **Acorde (Tríade)** e **Nota Pura** |
 | **`ESC` ou `Q`** | Encerra a aplicação |
 
----
-
-## Tabela de Gestos (Escala de Dó Maior)
-
-| Gesto da Mão | Nota | Frequência Base (Hz) | Observação |
-| :--- | :---: | :---: | :--- |
-| Apenas **Indicador** levantado | **DO** | 261.63 Hz | 1 dedo |
-| **Indicador + Médio** levantados | **RE** | 293.66 Hz | 2 dedos |
-| **Indicador + Médio + Anelar** levantados | **MI** | 329.63 Hz | 3 dedos |
-| **4 dedos** levantados (sem polegar) | **FA** | 349.23 Hz | Polegar recolhido na palma |
-| **Mão totalmente aberta** (5 dedos) | **SOL** | 392.00 Hz | Todos os dedos estendidos |
-| **Pinça** (polegar `[4]` + indicador `[8]`) | **LA** | 440.00 Hz | Distância normalizada `< 0.05` |
-| **Indicador + Mindinho** (gesto Rock) | **SI** | 493.88 Hz | 🤘 |
-| **Punho fechado** (nenhum dedo aberto) | **Silêncio** | — | Interrompe a nota suavemente |
-
-> **Modo 2 Mãos (tecla `M`):** A **mão direita** continua escolhendo a nota, enquanto a **mão esquerda** controla o **volume pela altura do punho** e a **oitava** pela quantidade de dedos abertos (`0–1` dedo = Grave `-1`, `2–3` dedos = Normal `0`, `4–5` dedos = Aguda `+1`).
+> **Touch Aéreo:** Aponte a ponta do dedo indicador para qualquer botão da barra superior por `0.40s` para acionar sem usar o teclado!
 
 ---
 
-## Controle Dinâmico de Volume pela Altura do Braço
+## Controles por Gestos (1 Mão vs. 2 Mãos)
 
-1. **Coordenada do Punho:** Lê `landmarks[0].y` (`0.0` topo → `1.0` base).
-2. **Clamping e Mapeamento Linear:** Faixa útil de `y = 0.85` (**10%**) até `y = 0.15` (**100%**).
-3. **Suavização Exponencial (EMA):** `vol_suave = 0.7 * vol_suave + 0.3 * vol_bruto` evita oscilações bruscas por tremores da mão.
-4. **VU Meter:** A barra lateral acompanha em tempo real com gradiente **Verde → Amarelo → Vermelho**.
+- **1 Mão (Modo Simplificado):** toca apenas as 8 notas (`DO4` a `DO5`) no Modo Maior com volume fixo (`75%`).
+- **2 Mãos (Modo Expressivo):**
+  - **Mão Esquerda:** escolhe a nota (`DO4` a `DO5`) ou `Silêncio` (punho fechado).
+  - **Mão Direita — Altura (`Y`):** controla o **volume** (`10%` a `100%`).
+  - **Mão Direita — Postura:** **Palma aberta** (`>= 3` dedos) = **MAIOR** *(verde + gatos felizes)*; **Punho fechado ou Pinça** = **MENOR** *(azul + gatos tristes)* sem cortar a nota.
+  - **Aproximar as duas mãos (eixo `X`):** ativa o **Arpejador automático** com uma corda luminosa vibrante entre as palmas (`4.5` a `9.5` notas/s quanto mais próximas).
+
+### Tabela das 8 Notas
+
+| Gesto da Mão | Nota | Gesto da Mão | Nota |
+| :--- | :---: | :--- | :---: |
+| Apenas **Indicador** | **DO4** | **5 dedos** (Mão aberta) | **SOL4** |
+| **Indicador + Médio** ("V") | **RE4** | **Hang Loose** (Polegar + Mindinho) | **LA4** |
+| **3 dedos** (Ind + Med + Ane) | **MI4** | **Rock / Chifres** (Ind + Min) | **SI4** |
+| **4 dedos** (sem polegar) | **FA4** | **Gesto "L"** (Polegar + Ind) | **DO5** |
 
 ---
 
-## Avaliador Musical e Memes (`assets/memes/`)
+## Onde Colocar as Imagens dos Gatos (`assets/`)
 
-Em **Modo Livre**, o módulo `music_evaluator.py` analisa as últimas 4–5 notas tocadas:
-- **Sequência Boa** (escalas como `DO → RE → MI → FA`, arpejos como `DO → MI → SOL`, melodias variadas) → Pop-up de **animal fofo** + fanfarra alegre!
-- **Sequência Ruim** (repetições robóticas como `DO → RE → DO → RE`, trítono `FA ↔ SI` ou saltos caóticos) → Pop-up de **gatinho triste** + efeito *"wah-wah"*!
+- `gestos-musicais/assets/happy/` → Gatos felizes (disparados em notas/acordes **Maiores**)
+- `gestos-musicais/assets/sad/` → Gatos tristes (disparados em notas/acordes **Menores**)
 
-Você pode adicionar ou trocar as imagens livremente colocando arquivos `.png`, `.jpg` ou `.webp` nas pastas:
-- `assets/memes/good/`
-- `assets/memes/bad/`
+Os memes disparam de forma probabilística (`40%` por nova nota atacada, cooldown mínimo de `1.5s`).

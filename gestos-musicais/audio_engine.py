@@ -1,164 +1,395 @@
-"""Motor de áudio em memória para o Theremin Gestual.
+"""Motor de áudio polifônico em memória com 5 instrumentos, reverb e arpejador.
 
-Inicializa o ``pygame.mixer`` com baixa latência e sintetiza em memória
-(via NumPy, sem arquivos ``.wav`` externos) as notas da escala de Dó Maior em
-múltiplos timbres e oitavas, além de efeitos sonoros curtos para os memes.
+Sintetiza em memória via NumPy (sem arquivos externos):
+- 5 instrumentos distintos: Piano, Violão (Karplus-Strong), Cordas, Synth e 8-Bit.
+- Reverb estéreo espacial (circular para loops contínuos e com cauda natural
+  para notas dedilhadas/percussivas).
+- Arquitetura de 16 canais no ``pygame.mixer`` separando Ao Vivo (sustentado +
+  pool polifônico de arpejos) e Mini-Looper (sustentado + pool de arpejos).
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import pygame
+
+ModoHarmonico = Literal["acorde", "nota"]
+TipoEscala = Literal["maior", "menor"]
 
 TAXA_AMOSTRAGEM: int = 44100
 TAMANHO_AMOSTRA: int = -16
 CANAIS_MIXER: int = 2
 BUFFER_MIXER: int = 512
-DURACAO_BUFFER_SEGUNDOS: float = 1.0
-AMPLITUDE_MAXIMA: int = 13500
-FADE_IN_MS: int = 25
-FADE_OUT_MS: int = 60
+DURACAO_BUFFER_LOOP_SEG: float = 1.0
+DURACAO_PLUCKED_SEG: float = 0.68
+AMPLITUDE_MAXIMA: int = 12000
+FADE_IN_MS: int = 22
+FADE_OUT_MS: int = 55
 
+# Escala completa de Dó4 a Dó5 (8 notas)
 NOTAS_FREQUENCIAS: dict[str, float] = {
-    "DO": 261.63,
-    "RE": 293.66,
-    "MI": 329.63,
-    "FA": 349.23,
-    "SOL": 392.00,
-    "LA": 440.00,
-    "SI": 493.88,
+    "DO4": 261.63,
+    "RE4": 293.66,
+    "MI4": 329.63,
+    "FA4": 349.23,
+    "SOL4": 392.00,
+    "LA4": 440.00,
+    "SI4": 493.88,
+    "DO5": 523.25,
 }
 
-TIMBRES: tuple[str, ...] = ("theremin", "flauta", "8bit")
-NOMES_TIMBRES: dict[str, str] = {
-    "theremin": "Theremin",
-    "flauta": "Flauta Synth",
-    "8bit": "Retro 8-bit",
+NOTAS_MENOR_NATURAL: dict[str, float] = {
+    "DO4": 261.63,
+    "RE4": 293.66,
+    "MI4": 311.13,
+    "FA4": 349.23,
+    "SOL4": 392.00,
+    "LA4": 415.30,
+    "SI4": 466.16,
+    "DO5": 523.25,
 }
-OITAVAS_VALIDAS: tuple[int, ...] = (-1, 0, 1)
+
+NOTAS_MIDI: dict[str, int] = {
+    "DO4": 60,
+    "RE4": 62,
+    "MI4": 64,
+    "FA4": 65,
+    "SOL4": 67,
+    "LA4": 69,
+    "SI4": 71,
+    "DO5": 72,
+}
+
+NOTAS_MIDI_MENOR_NATURAL: dict[str, int] = {
+    "DO4": 60,
+    "RE4": 62,
+    "MI4": 63,
+    "FA4": 65,
+    "SOL4": 67,
+    "LA4": 68,
+    "SI4": 70,
+    "DO5": 72,
+}
+
+TIMBRES: tuple[str, ...] = ("piano", "violao", "cordas", "synth", "8bit")
+NOMES_TIMBRES: dict[str, str] = {
+    "piano": "Piano",
+    "violao": "Violao",
+    "cordas": "Cordas",
+    "synth": "Synth",
+    "8bit": "8-Bit",
+}
+MODOS_HARMONICOS: tuple[ModoHarmonico, ...] = ("acorde", "nota")
+ESCALAS_VALIDAS: tuple[TipoEscala, ...] = ("maior", "menor")
+
+_PESOS_TRIADE: tuple[float, float, float] = (0.46, 0.29, 0.25)
+_TAPS_REVERB_ESQ: tuple[tuple[int, float], ...] = ((1367, 0.22), (2903, 0.14), (4721, 0.08))
+_TAPS_REVERB_DIR: tuple[tuple[int, float], ...] = ((1693, 0.22), (3371, 0.14), (5237, 0.08))
 
 _inicializado: bool = False
-_sons: dict[tuple[str, int, str], pygame.mixer.Sound] = {}
-_sfx_memes: dict[str, pygame.mixer.Sound] = {}
-_canais: list[pygame.mixer.Channel] = []
-_canal_sfx: pygame.mixer.Channel | None = None
-_canal_idx: int = 0
+_sons_loop: dict[tuple[str, ModoHarmonico, TipoEscala, str], pygame.mixer.Sound] = {}
+_sons_plucked: dict[tuple[str, int], pygame.mixer.Sound] = {}
 
-_nota_ativa: str | None = None
-_som_ativo: pygame.mixer.Sound | None = None
-_volume_atual: float = 0.8
-_timbre_atual: str = "theremin"
-_oitava_atual: int = 0
+_canais_loop_vivo: tuple[pygame.mixer.Channel, pygame.mixer.Channel] | None = None
+_canais_loop_looper: tuple[pygame.mixer.Channel, pygame.mixer.Channel] | None = None
+_canais_plucked_vivo: list[pygame.mixer.Channel] = []
+_canais_plucked_looper: list[pygame.mixer.Channel] = []
+
+_idx_loop_vivo: int = 0
+_idx_loop_looper: int = 0
+_idx_plucked_vivo: int = 0
+_idx_plucked_looper: int = 0
+
+_nota_ativa_vivo: str | None = None
+_escala_ativa_vivo: TipoEscala = "maior"
+_arpejo_ativo_vivo: bool = False
+_volume_atual_vivo: float = 0.75
+_timbre_atual: str = "piano"
+_modo_harmonico_atual: ModoHarmonico = "acorde"
 
 
 def _limitar_volume(volume: float) -> float:
-    """Garante que o volume permaneça na faixa operacional [0.1, 1.0]."""
-    return max(0.1, min(1.0, float(volume)))
+    """Garante que o volume permaneça na faixa operacional [0.08, 1.0]."""
+    return max(0.08, min(1.0, float(volume)))
 
 
-def _array_para_som(amostras: np.ndarray) -> pygame.mixer.Sound:
-    """Converte vetor float [-1, 1] em ``pygame.mixer.Sound`` estéreo 16-bit."""
-    forma_onda = (np.clip(amostras, -1.0, 1.0) * AMPLITUDE_MAXIMA).astype(np.int16)
-    estereo = np.ascontiguousarray(np.column_stack((forma_onda, forma_onda)))
-    return pygame.sndarray.make_sound(estereo)
+def _midi_para_freq(midi: int) -> float:
+    """Converte número de nota MIDI para frequência em Hz (A4 = 69 -> 440 Hz)."""
+    return 440.0 * (2.0 ** ((midi - 69) / 12.0))
 
 
-def _gerar_onda_nota(frequencia: float, timbre: str) -> pygame.mixer.Sound:
-    """Sintetiza um buffer contínuo em loop perfeito para o timbre e frequência dados."""
-    num_ciclos = max(1, round(frequencia * DURACAO_BUFFER_SEGUNDOS))
-    num_amostras = max(1, round(num_ciclos * TAXA_AMOSTRAGEM / frequencia))
-    u = np.linspace(0.0, 1.0, num_amostras, endpoint=False)
-    fase = 2.0 * np.pi * num_ciclos * u
+def _aplicar_reverb_estereo(onda: np.ndarray, circular: bool) -> np.ndarray:
+    """Aplica eco/reverb espacial estéreo preservando fase em loops ou com cauda limpa."""
+    esq = onda.copy()
+    dir_ = onda.copy()
+    n = len(onda)
 
-    if timbre == "theremin":
-        # Onda senoidal com vibrato suave (5 ciclos exatos por segundo -> loop sem clique)
-        onda = np.sin(fase + 0.08 * np.sin(2.0 * np.pi * 5.0 * u))
-    elif timbre == "flauta":
-        onda = (
-            0.72 * np.sin(fase)
-            + 0.20 * np.sin(2.0 * fase)
-            + 0.08 * np.sin(3.0 * fase)
-        )
-    elif timbre == "8bit":
-        base = 0.68 * np.sin(fase) + 0.22 * np.sin(3.0 * fase) + 0.10 * np.sin(5.0 * fase)
-        onda = np.tanh(1.7 * base) * 0.78
+    if circular:
+        for atraso, ganho in _TAPS_REVERB_ESQ:
+            esq += ganho * np.roll(onda, atraso)
+        for atraso, ganho in _TAPS_REVERB_DIR:
+            dir_ += ganho * np.roll(onda, atraso)
     else:
-        onda = np.sin(fase)
+        for atraso, ganho in _TAPS_REVERB_ESQ:
+            if atraso < n:
+                esq[atraso:] += ganho * onda[:-atraso]
+        for atraso, ganho in _TAPS_REVERB_DIR:
+            if atraso < n:
+                dir_[atraso:] += ganho * onda[:-atraso]
 
-    return _array_para_som(onda)
-
-
-def _gerar_sfx_fanfarra() -> pygame.mixer.Sound:
-    """Sintetiza mini fanfarra alegre para sequências boas."""
-    notas_arp = (523.25, 659.25, 783.99, 1046.50)
-    segmentos: list[np.ndarray] = []
-    for idx, freq in enumerate(notas_arp):
-        dur = 0.085 if idx < len(notas_arp) - 1 else 0.24
-        n = int(TAXA_AMOSTRAGEM * dur)
-        t = np.arange(n, dtype=np.float64) / TAXA_AMOSTRAGEM
-        env = np.minimum(1.0, t / 0.01) * np.exp(-t * (8.0 if idx < 3 else 5.5))
-        seg = (0.75 * np.sin(2.0 * np.pi * freq * t) + 0.25 * np.sin(4.0 * np.pi * freq * t)) * env
-        segmentos.append(seg)
-    return _array_para_som(np.concatenate(segmentos) * 0.7)
+    estereo = np.column_stack((esq, dir_)) * (1.0 / 1.44)
+    return np.clip(estereo, -1.0, 1.0)
 
 
-def _gerar_sfx_wah_wah() -> pygame.mixer.Sound:
-    """Sintetiza efeito cômico descendente 'wah-wah-waaaah' para sequências ruins."""
-    passos = ((311.13, 0.17), (293.66, 0.17), (277.18, 0.18), (246.94, 0.42))
-    segmentos: list[np.ndarray] = []
-    for idx, (freq, dur) in enumerate(passos):
-        n = int(TAXA_AMOSTRAGEM * dur)
-        t = np.arange(n, dtype=np.float64) / TAXA_AMOSTRAGEM
-        if idx == len(passos) - 1:
-            freq_inst = freq * (1.0 - 0.12 * (t / dur))
-            fase = 2.0 * np.pi * np.cumsum(freq_inst) / TAXA_AMOSTRAGEM
-            env = np.minimum(1.0, t / 0.015) * np.exp(-t * 2.8)
-        else:
-            fase = 2.0 * np.pi * freq * t
-            env = np.minimum(1.0, t / 0.012) * np.exp(-t * 5.0)
-        seg = (0.75 * np.sin(fase) + 0.25 * np.sin(2.0 * fase)) * env
-        segmentos.append(seg)
-    return _array_para_som(np.concatenate(segmentos) * 0.72)
+def _estereo_para_som(estereo: np.ndarray) -> pygame.mixer.Sound:
+    """Converte matriz float ``(N, 2)`` em ``pygame.mixer.Sound`` 16-bit."""
+    pcm = np.ascontiguousarray((np.clip(estereo, -1.0, 1.0) * AMPLITUDE_MAXIMA).astype(np.int16))
+    som = pygame.sndarray.make_sound(pcm)
+    som.set_volume(1.0)
+    return som
+
+
+def _frequencias_para_modo(
+    nota: str,
+    escala: TipoEscala,
+    modo_harmonico: ModoHarmonico,
+) -> list[tuple[float, float]]:
+    """Retorna lista de ``(frequencia_hz, peso)`` para acorde ou nota pura."""
+    chave = nota.upper()
+    if modo_harmonico == "nota":
+        tabela = NOTAS_FREQUENCIAS if escala == "maior" else NOTAS_MENOR_NATURAL
+        return [(tabela[chave], 1.0)]
+
+    freq_base = NOTAS_FREQUENCIAS[chave]
+    semitons_terca = 4 if escala == "maior" else 3
+    freqs = (
+        freq_base,
+        freq_base * (2.0 ** (semitons_terca / 12.0)),
+        freq_base * (2.0 ** (7.0 / 12.0)),
+    )
+    return list(zip(freqs, _PESOS_TRIADE))
+
+
+def _sintetizar_voz_loop(u: np.ndarray, frequencia: float, timbre: str) -> np.ndarray:
+    """Sintetiza voz contínua com número inteiro de ciclos em ``u in [0, 1)``."""
+    ciclos = max(1, round(frequencia * DURACAO_BUFFER_LOOP_SEG))
+    fase = 2.0 * np.pi * ciclos * u
+
+    if timbre == "piano":
+        return (
+            0.62 * np.sin(fase)
+            + 0.24 * np.sin(2.0 * fase)
+            + 0.10 * np.sin(3.0 * fase)
+            + 0.04 * np.sin(4.0 * fase)
+        )
+    if timbre == "violao":
+        return 0.68 * np.sin(fase) + 0.22 * np.sin(2.0 * fase) + 0.10 * np.sin(3.0 * fase)
+    if timbre == "cordas":
+        # Ensemble com micro-desafinação exata (+/- 0.5 Hz em buffer de 2.0s) sem clique
+        f_a = 2.0 * np.pi * max(1, ciclos - 1) * u
+        f_b = 2.0 * np.pi * (ciclos + 1) * u
+        base = 0.44 * np.sin(fase) + 0.28 * np.sin(f_a) + 0.28 * np.sin(f_b)
+        return 0.72 * base + 0.20 * np.sin(2.0 * fase) + 0.08 * np.sin(3.0 * fase)
+    if timbre == "synth":
+        sub = 0.24 * np.sin(2.0 * np.pi * max(1, ciclos // 2) * u)
+        serra = (
+            0.46 * np.sin(fase)
+            + 0.22 * np.sin(2.0 * fase)
+            + 0.13 * np.sin(3.0 * fase)
+            + 0.08 * np.sin(4.0 * fase)
+        )
+        return np.tanh(1.25 * (serra + sub)) * 0.85
+    if timbre == "8bit":
+        bruta = 0.68 * np.sin(fase) + 0.22 * np.sin(3.0 * fase) + 0.10 * np.sin(5.0 * fase)
+        return np.round(np.tanh(1.8 * bruta) * 5.0) / 6.0
+    return np.sin(fase)
+
+
+def _sintetizar_plucked(midi: int, timbre: str) -> np.ndarray:
+    """Sintetiza nota one-shot expressiva com cauda de reverb estéreo."""
+    n = round(TAXA_AMOSTRAGEM * DURACAO_PLUCKED_SEG)
+    t = np.arange(n, dtype=np.float64) / TAXA_AMOSTRAGEM
+    freq = _midi_para_freq(midi)
+    fase = 2.0 * np.pi * freq * t
+
+    if timbre == "violao":
+        # Síntese física Karplus-Strong vetorizada por fatias de período
+        periodo = max(8, round(TAXA_AMOSTRAGEM / freq))
+        rng = np.random.default_rng(midi)
+        pulso = rng.uniform(-1.0, 1.0, periodo)
+        pulso = 0.5 * (pulso + np.roll(pulso, 1))
+        pulso -= pulso.mean()
+        onda = np.zeros(n, dtype=np.float64)
+        onda[:periodo] = pulso
+        for inicio in range(periodo, n, periodo):
+            ant = onda[inicio - periodo : inicio]
+            filtrado = 0.992 * 0.5 * (ant + np.roll(ant, -1))
+            tam = min(periodo, n - inicio)
+            onda[inicio : inicio + tam] = filtrado[:tam]
+        onda *= 1.15
+    elif timbre == "piano":
+        env = (0.72 * np.exp(-t * 4.4) + 0.28 * np.exp(-t * 1.6)) * np.minimum(1.0, t / 0.004)
+        brilho = np.exp(-t * 16.0)
+        onda = (
+            0.56 * np.sin(fase)
+            + 0.26 * np.sin(2.0 * fase) * (0.35 + 0.65 * brilho)
+            + 0.12 * np.sin(3.0 * fase) * brilho
+            + 0.06 * np.sin(4.0 * fase) * brilho
+        ) * env
+    elif timbre == "cordas":
+        env = (1.0 - np.exp(-t * 24.0)) * np.exp(-t * 2.2)
+        onda = (
+            0.52 * np.sin(fase)
+            + 0.24 * np.sin(2.0 * np.pi * (freq * 0.997) * t)
+            + 0.24 * np.sin(2.0 * np.pi * (freq * 1.003) * t)
+            + 0.14 * np.sin(2.0 * fase)
+        ) * env
+    elif timbre == "synth":
+        env = np.minimum(1.0, t / 0.006) * np.exp(-t * 3.2)
+        onda = np.tanh(
+            1.35 * (
+                0.48 * np.sin(fase)
+                + 0.24 * np.sin(2.0 * fase)
+                + 0.14 * np.sin(3.0 * fase)
+                + 0.22 * np.sin(0.5 * fase)
+            )
+        ) * env
+    else:  # 8bit
+        env = np.minimum(1.0, t / 0.003) * np.exp(-t * 4.6)
+        bruta = 0.68 * np.sin(fase) + 0.22 * np.sin(3.0 * fase) + 0.10 * np.sin(5.0 * fase)
+        onda = (np.round(np.tanh(1.8 * bruta) * 5.0) / 6.0) * env
+
+    # Fade-in/out curto antes do reverb para garantir zero cliques
+    fade_in = min(n, round(0.003 * TAXA_AMOSTRAGEM))
+    fade_out = min(n, round(0.060 * TAXA_AMOSTRAGEM))
+    if fade_in > 0:
+        onda[:fade_in] *= np.linspace(0.0, 1.0, fade_in)
+    if fade_out > 0:
+        onda[-fade_out:] *= np.linspace(1.0, 0.0, fade_out)
+
+    estereo = _aplicar_reverb_estereo(onda, circular=False)
+    estereo[-fade_out:, :] *= np.linspace(1.0, 0.0, fade_out)[:, None]
+    return estereo
+
+
+def gerar_buffer_onda(
+    nota: str,
+    escala: TipoEscala,
+    timbre: str,
+    modo_harmonico: ModoHarmonico,
+) -> np.ndarray:
+    """Gera matriz estéreo ``(N, 2)`` contínua com reverb circular para testes e mixer."""
+    num_amostras = round(TAXA_AMOSTRAGEM * DURACAO_BUFFER_LOOP_SEG)
+    u = np.linspace(0.0, 1.0, num_amostras, endpoint=False)
+    vozes = _frequencias_para_modo(nota, escala, modo_harmonico)
+
+    soma = np.zeros(num_amostras, dtype=np.float64)
+    for freq, peso in vozes:
+        soma += peso * _sintetizar_voz_loop(u, freq, timbre)
+
+    return _aplicar_reverb_estereo(np.clip(soma, -1.0, 1.0), circular=True)
 
 
 def inicializar_audio() -> None:
-    """Inicializa o mixer de baixa latência e sintetiza notas e efeitos em memória."""
-    global _inicializado, _sons, _sfx_memes, _canais, _canal_sfx
+    """Inicializa o mixer de 16 canais e pré-sintetiza os 5 instrumentos."""
+    global _inicializado, _sons_loop, _sons_plucked
+    global _canais_loop_vivo, _canais_loop_looper
+    global _canais_plucked_vivo, _canais_plucked_looper
+    global _idx_loop_vivo, _idx_loop_looper, _idx_plucked_vivo, _idx_plucked_looper
 
     if _inicializado and pygame.mixer.get_init() is not None:
         return
 
-    pygame.mixer.pre_init(
-        frequency=TAXA_AMOSTRAGEM,
-        size=TAMANHO_AMOSTRA,
-        channels=CANAIS_MIXER,
-        buffer=BUFFER_MIXER,
-    )
-    pygame.mixer.init(
-        frequency=TAXA_AMOSTRAGEM,
-        size=TAMANHO_AMOSTRA,
-        channels=CANAIS_MIXER,
-        buffer=BUFFER_MIXER,
-    )
-    pygame.mixer.set_num_channels(8)
+    if pygame.mixer.get_init() is None:
+        pygame.mixer.pre_init(
+            frequency=TAXA_AMOSTRAGEM,
+            size=TAMANHO_AMOSTRA,
+            channels=CANAIS_MIXER,
+            buffer=BUFFER_MIXER,
+        )
+        pygame.mixer.init(
+            frequency=TAXA_AMOSTRAGEM,
+            size=TAMANHO_AMOSTRA,
+            channels=CANAIS_MIXER,
+            buffer=BUFFER_MIXER,
+        )
 
-    _sons = {
-        (timbre, oitava, nota): _gerar_onda_nota(freq * (2.0 ** oitava), timbre)
+    pygame.mixer.set_num_channels(16)
+
+    # Pré-calcula cada voz MIDI (60..80) com reverb linear circular uma única vez,
+    # evitando recalcular senoides repetidas na montagem das 160 combinações.
+    num_amostras_loop = round(TAXA_AMOSTRAGEM * DURACAO_BUFFER_LOOP_SEG)
+    u_loop = np.linspace(0.0, 1.0, num_amostras_loop, endpoint=False)
+    vozes_estereo: dict[tuple[str, int], np.ndarray] = {
+        (timbre, midi): _aplicar_reverb_estereo(
+            _sintetizar_voz_loop(u_loop, _midi_para_freq(midi), timbre),
+            circular=True,
+        )
         for timbre in TIMBRES
-        for oitava in OITAVAS_VALIDAS
-        for nota, freq in NOTAS_FREQUENCIAS.items()
+        for midi in range(60, 81)
     }
-    _sfx_memes = {
-        "good": _gerar_sfx_fanfarra(),
-        "bad": _gerar_sfx_wah_wah(),
+
+    _sons_loop = {}
+    for timbre in TIMBRES:
+        for modo in MODOS_HARMONICOS:
+            for escala in ESCALAS_VALIDAS:
+                for nota in NOTAS_FREQUENCIAS:
+                    if modo == "nota":
+                        midi_n = NOTAS_MIDI[nota] if escala == "maior" else NOTAS_MIDI_MENOR_NATURAL[nota]
+                        estereo = vozes_estereo[(timbre, midi_n)]
+                    else:
+                        midi_base = NOTAS_MIDI[nota]
+                        terca = 4 if escala == "maior" else 3
+                        estereo = (
+                            _PESOS_TRIADE[0] * vozes_estereo[(timbre, midi_base)]
+                            + _PESOS_TRIADE[1] * vozes_estereo[(timbre, midi_base + terca)]
+                            + _PESOS_TRIADE[2] * vozes_estereo[(timbre, midi_base + 7)]
+                        )
+                    _sons_loop[(timbre, modo, escala, nota)] = _estereo_para_som(estereo)
+
+    _sons_plucked = {
+        (timbre, midi): _estereo_para_som(_sintetizar_plucked(midi, timbre))
+        for timbre in TIMBRES
+        for midi in range(60, 85)
     }
-    _canais = [pygame.mixer.Channel(0), pygame.mixer.Channel(1)]
-    _canal_sfx = pygame.mixer.Channel(2)
+
+    _canais_loop_vivo = (pygame.mixer.Channel(0), pygame.mixer.Channel(1))
+    _canais_plucked_vivo = [pygame.mixer.Channel(i) for i in range(2, 10)]
+    _canais_loop_looper = (pygame.mixer.Channel(10), pygame.mixer.Channel(11))
+    _canais_plucked_looper = [pygame.mixer.Channel(i) for i in range(12, 16)]
+
+    _idx_loop_vivo = 0
+    _idx_loop_looper = 0
+    _idx_plucked_vivo = 0
+    _idx_plucked_looper = 0
     _inicializado = True
 
 
+def _disparar_plucked_no_pool(som: pygame.mixer.Sound, volume: float, canal_looper: bool) -> None:
+    """Seleciona canal livre no pool polifônico (ou gira round-robin) e toca."""
+    global _idx_plucked_vivo, _idx_plucked_looper
+
+    pool = _canais_plucked_looper if canal_looper else _canais_plucked_vivo
+    if not pool:
+        return
+
+    escolhido = next((ch for ch in pool if not ch.get_busy()), None)
+    if escolhido is None:
+        if canal_looper:
+            escolhido = pool[_idx_plucked_looper % len(pool)]
+            _idx_plucked_looper = (_idx_plucked_looper + 1) % len(pool)
+        else:
+            escolhido = pool[_idx_plucked_vivo % len(pool)]
+            _idx_plucked_vivo = (_idx_plucked_vivo + 1) % len(pool)
+
+    escolhido.set_volume(volume)
+    escolhido.play(som)
+
+
 def definir_timbre(timbre: str | int) -> str:
-    """Altera o timbre ativo (por nome ou índice 1..3) com transição imediata."""
+    """Altera o instrumento ativo (1..5 ou nome) com transição imediata."""
     global _timbre_atual
 
     if isinstance(timbre, int):
@@ -167,117 +398,193 @@ def definir_timbre(timbre: str | int) -> str:
     else:
         novo = timbre.lower()
         if novo not in TIMBRES:
-            raise ValueError(f"Timbre inválido '{timbre}'. Opções: {TIMBRES}")
+            raise ValueError(f"Instrumento inválido '{timbre}'. Opções: {TIMBRES}")
 
     if novo != _timbre_atual:
         _timbre_atual = novo
-        if _nota_ativa is not None:
-            tocar_nota(_nota_ativa, _volume_atual)
+        if _nota_ativa_vivo is not None and not _arpejo_ativo_vivo:
+            tocar_nota(_nota_ativa_vivo, _escala_ativa_vivo, _volume_atual_vivo, arpejo=False)
     return _timbre_atual
 
 
-def definir_oitava(oitava: int) -> int:
-    """Define a oitava ativa (``-1``, ``0`` ou ``1``), ajustando nota em curso se houver."""
-    global _oitava_atual
+def alternar_modo_harmonico() -> ModoHarmonico:
+    """Alterna entre ``'acorde'`` (tríade) e ``'nota'`` (nota individual)."""
+    global _modo_harmonico_atual
 
-    nova = max(-1, min(1, int(oitava)))
-    if nova != _oitava_atual:
-        _oitava_atual = nova
-        if _nota_ativa is not None:
-            tocar_nota(_nota_ativa, _volume_atual)
-    return _oitava_atual
+    _modo_harmonico_atual = "nota" if _modo_harmonico_atual == "acorde" else "acorde"
+    if _nota_ativa_vivo is not None and not _arpejo_ativo_vivo:
+        tocar_nota(_nota_ativa_vivo, _escala_ativa_vivo, _volume_atual_vivo, arpejo=False)
+    return _modo_harmonico_atual
 
 
-def obter_frequencia_efetiva(nota: str) -> float:
-    """Retorna a frequência em Hz da nota considerando a oitava ativa."""
-    return NOTAS_FREQUENCIAS[nota.upper()] * (2.0 ** _oitava_atual)
-
-
-def obter_estado_audio() -> tuple[str, int]:
-    """Retorna ``(timbre_atual, oitava_atual)``."""
-    return _timbre_atual, _oitava_atual
-
-
-def tocar_nota(nota: str, volume: float = 0.8) -> None:
-    """Dispara a nota solicitada em sustentação contínua aplicando o volume inicial."""
-    global _canal_idx, _nota_ativa, _som_ativo, _volume_atual
-
-    inicializar_audio()
+def obter_frequencia_referencia(nota: str, escala: TipoEscala = "maior") -> float:
+    """Retorna a frequência fundamental em Hz para exibição na HUD."""
     chave = nota.upper()
-    if chave not in NOTAS_FREQUENCIAS:
-        raise ValueError(f"Nota inválida '{nota}'. Use uma de: {list(NOTAS_FREQUENCIAS)}")
+    if _modo_harmonico_atual == "nota" and escala == "menor":
+        return NOTAS_MENOR_NATURAL[chave]
+    return NOTAS_FREQUENCIAS[chave]
+
+
+def obter_estado_audio() -> tuple[str, ModoHarmonico]:
+    """Retorna ``(timbre_atual, modo_harmonico_atual)``."""
+    return _timbre_atual, _modo_harmonico_atual
+
+
+def atualizar_volume(volume: float, canal_looper: bool = False) -> None:
+    """Atualiza em tempo real o volume dos canais sustentados ativos."""
+    global _volume_atual_vivo
 
     vol = _limitar_volume(volume)
-    _volume_atual = vol
-    som = _sons[(_timbre_atual, _oitava_atual, chave)]
-
-    canal_anterior = _canais[_canal_idx]
-    if canal_anterior.get_busy():
-        canal_anterior.fadeout(FADE_OUT_MS)
-
-    _canal_idx = 1 - _canal_idx
-    canal_novo = _canais[_canal_idx]
-    canal_novo.set_volume(1.0)
-    som.set_volume(vol)
-    canal_novo.play(som, loops=-1, fade_ms=FADE_IN_MS)
-
-    _nota_ativa = chave
-    _som_ativo = som
-
-
-def atualizar_volume(volume: float) -> None:
-    """Ajusta em tempo real o volume do som ativo enquanto a nota está soando."""
-    global _volume_atual
-
-    vol = _limitar_volume(volume)
-    _volume_atual = vol
-    if not _inicializado or _som_ativo is None:
-        return
-    _som_ativo.set_volume(vol)
-
-
-def tocar_sfx_meme(categoria: str) -> None:
-    """Dispara o efeito sonoro curto associado ao meme ('good' ou 'bad')."""
-    inicializar_audio()
-    sfx = _sfx_memes.get(categoria)
-    if sfx is None or _canal_sfx is None:
-        return
-    _canal_sfx.set_volume(0.55)
-    _canal_sfx.play(sfx)
-
-
-def parar_nota() -> None:
-    """Interrompe suavemente a nota em reprodução (silêncio)."""
-    global _nota_ativa, _som_ativo
+    if not canal_looper:
+        _volume_atual_vivo = vol
 
     if not _inicializado:
         return
 
-    for canal in _canais:
-        if canal.get_busy():
-            canal.fadeout(FADE_OUT_MS)
+    par = _canais_loop_looper if canal_looper else _canais_loop_vivo
+    if par is None:
+        return
+    for ch in par:
+        if ch.get_busy():
+            ch.set_volume(vol)
 
-    _nota_ativa = None
-    _som_ativo = None
+
+def tocar_nota(
+    nota: str,
+    escala: TipoEscala = "maior",
+    volume: float = 0.75,
+    arpejo: bool = False,
+    timbre_override: str | None = None,
+    canal_looper: bool = False,
+) -> None:
+    """Toca o acorde/nota sustentado (ou prepara o modo arpejo silencioso)."""
+    global _idx_loop_vivo, _idx_loop_looper
+    global _nota_ativa_vivo, _escala_ativa_vivo, _arpejo_ativo_vivo, _volume_atual_vivo
+
+    inicializar_audio()
+    chave = nota.upper()
+    if chave not in NOTAS_FREQUENCIAS:
+        raise ValueError(f"Nota inválida '{nota}'.")
+    if escala not in ESCALAS_VALIDAS:
+        raise ValueError(f"Escala inválida '{escala}'.")
+
+    vol = _limitar_volume(volume)
+    timbre_efetivo = (timbre_override or _timbre_atual).lower()
+    if timbre_efetivo not in TIMBRES:
+        timbre_efetivo = _timbre_atual
+
+    if not canal_looper:
+        _nota_ativa_vivo = chave
+        _escala_ativa_vivo = escala
+        _arpejo_ativo_vivo = arpejo
+        _volume_atual_vivo = vol
+
+    par = _canais_loop_looper if canal_looper else _canais_loop_vivo
+    if par is None:
+        return
+
+    if arpejo:
+        for ch in par:
+            if ch.get_busy():
+                ch.fadeout(FADE_OUT_MS)
+        return
+
+    idx_atual = _idx_loop_looper if canal_looper else _idx_loop_vivo
+    ch_ant = par[idx_atual]
+    if ch_ant.get_busy():
+        ch_ant.fadeout(FADE_OUT_MS)
+
+    novo_idx = 1 - idx_atual
+    if canal_looper:
+        _idx_loop_looper = novo_idx
+    else:
+        _idx_loop_vivo = novo_idx
+
+    ch_novo = par[novo_idx]
+    som_loop = _sons_loop[(timbre_efetivo, _modo_harmonico_atual, escala, chave)]
+    fator_sust = 0.62 if timbre_efetivo in ("piano", "violao") else 1.0
+    ch_novo.set_volume(vol * fator_sust)
+    ch_novo.play(som_loop, loops=-1, fade_ms=FADE_IN_MS)
+
+    # Ataque percussivo inicial em Piano e Violão para maior realismo acústico
+    if timbre_efetivo in ("piano", "violao"):
+        midi_base = NOTAS_MIDI_MENOR_NATURAL[chave] if (_modo_harmonico_atual == "nota" and escala == "menor") else NOTAS_MIDI[chave]
+        som_atk = _sons_plucked.get((timbre_efetivo, midi_base))
+        if som_atk is not None:
+            _disparar_plucked_no_pool(som_atk, vol * 0.65, canal_looper)
+
+
+def disparar_passo_arpejo(
+    nota: str,
+    escala: TipoEscala = "maior",
+    passo: int = 0,
+    volume: float = 0.75,
+    timbre_override: str | None = None,
+    canal_looper: bool = False,
+) -> int:
+    """Dispara a próxima nota dedilhada do arpejo e retorna o próximo índice."""
+    inicializar_audio()
+    chave = nota.upper()
+    if chave not in NOTAS_FREQUENCIAS:
+        return 0
+
+    vol = _limitar_volume(volume)
+    timbre_efetivo = (timbre_override or _timbre_atual).lower()
+    if timbre_efetivo not in TIMBRES:
+        timbre_efetivo = _timbre_atual
+
+    if _modo_harmonico_atual == "acorde":
+        midi_base = NOTAS_MIDI[chave]
+        terca = 4 if escala == "maior" else 3
+        intervalos = (0, terca, 7, 12)
+    else:
+        midi_base = NOTAS_MIDI[chave] if escala == "maior" else NOTAS_MIDI_MENOR_NATURAL[chave]
+        intervalos = (0, 12)
+
+    idx = passo % len(intervalos)
+    midi_alvo = max(60, min(84, midi_base + intervalos[idx]))
+    som = _sons_plucked.get((timbre_efetivo, midi_alvo))
+    if som is not None:
+        _disparar_plucked_no_pool(som, vol, canal_looper)
+
+    return (idx + 1) % len(intervalos)
+
+
+def parar_nota(canal_looper: bool = False) -> None:
+    """Interrompe suavemente o canal sustentado (ao vivo ou do looper)."""
+    global _nota_ativa_vivo, _arpejo_ativo_vivo
+
+    if not canal_looper:
+        _nota_ativa_vivo = None
+        _arpejo_ativo_vivo = False
+
+    if not _inicializado:
+        return
+
+    par = _canais_loop_looper if canal_looper else _canais_loop_vivo
+    if par is None:
+        return
+    for ch in par:
+        if ch.get_busy():
+            ch.fadeout(FADE_OUT_MS)
 
 
 def encerrar_audio() -> None:
     """Libera os recursos do mixer ao finalizar a aplicação."""
-    global _inicializado, _sons, _sfx_memes, _canais, _canal_sfx, _nota_ativa, _som_ativo
+    global _inicializado, _canais_loop_vivo, _canais_loop_looper
+    global _nota_ativa_vivo, _arpejo_ativo_vivo
 
     if _inicializado and pygame.mixer.get_init() is not None:
-        parar_nota()
-        if _canal_sfx is not None and _canal_sfx.get_busy():
-            _canal_sfx.stop()
+        parar_nota(canal_looper=False)
+        parar_nota(canal_looper=True)
         pygame.mixer.quit()
 
-    _sons.clear()
-    _sfx_memes.clear()
-    _canais.clear()
-    _canal_sfx = None
-    _nota_ativa = None
-    _som_ativo = None
+    _sons_loop.clear()
+    _sons_plucked.clear()
+    _canais_loop_vivo = None
+    _canais_loop_looper = None
+    _canais_plucked_vivo.clear()
+    _canais_plucked_looper.clear()
+    _nota_ativa_vivo = None
+    _arpejo_ativo_vivo = False
     _inicializado = False
-
-
-inicializar_audio()

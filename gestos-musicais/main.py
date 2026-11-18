@@ -1,412 +1,391 @@
-"""Theremin Gestual — Instrumento musical via webcam com memes, timbres e modo 2 mãos.
+"""Tocador Musical Gestual — Instrumento interativo HD com 5 timbres, arpejador e looper.
 
-Reconhece gestos geométricos da mão via MediaPipe Hands para tocar notas da
-escala de Dó Maior, modula a intensidade sonora pela altura do punho, avalia
-sequências musicais em tempo real exibindo memes animados e suporta timbres
-selecionáveis e controle opcional com duas mãos.
+Adapta dinamicamente os controles conforme o número de mãos detectadas:
+- 1 Mão (Simplificado): mapeia as 8 notas (DO4 a DO5) no Modo Maior padrão.
+- 2 Mãos (Expressivo):
+  * Mão Esquerda: seleciona a nota musical (DO4 a DO5) ou Silêncio.
+  * Mão Direita: controla o volume (eixo Y) e alterna MAIOR (palma aberta) vs.
+    MENOR (punho fechado ou pinça).
+  * Aproximar as mãos na horizontal: ativa o Arpejador com corda luminosa.
+
+Suporta janela expansível / Tela Cheia (F), touch aéreo na barra superior,
+Mini-Looper (R), guia sob demanda (G ou botão [?]) e pop-ups de gatos.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Any, Sequence
+import time
+from typing import Sequence
 
 import cv2
 import mediapipe as mp
-import numpy as np
 
 import audio_engine
-from meme_overlay import GerenciadorMemes
-from music_evaluator import AvaliadorMusical
+from hand_tracker import RastreadorMaos, TipoEscala
+from looper import MiniLooper
+from meme_overlay import SistemaParticulasMemes
+import ui_renderer
+from ui_renderer import BotaoUI
 
-# Parâmetros de mapeamento da altura do punho para volume
-Y_TOPO: float = 0.15
-Y_BASE: float = 0.85
-VOL_MIN: float = 0.10
-VOL_MAX: float = 1.00
-EMA_PESO_ATUAL: float = 0.70
-EMA_PESO_BRUTO: float = 0.30
+# ---------------------------------------------------------------------------
+# Parâmetros de Calibração: Debounce Temporal e Touch Aéreo
+# ---------------------------------------------------------------------------
+FRAMES_CONFIRMACAO_NOTA: int = 5
+TEMPO_ESTABILIDADE_SEGUNDOS: float = 0.095
+TEMPO_DWELL_TOUCH: float = 0.40
+COOLDOWN_TOUCH: float = 0.70
 
-# Parâmetros de detecção de gestos e debounce
-LIMIAR_PINCA: float = 0.05
-FRAMES_CONFIRMACAO: int = 3
-
-# Índices dos landmarks (MediaPipe Hands)
-PUNHO = 0
-POLEGAR_MCP = 2
-POLEGAR_IP = 3
-POLEGAR_TIP = 4
-INDICADOR_PIP = 6
-INDICADOR_TIP = 8
-MEDIO_PIP = 10
-MEDIO_TIP = 12
-ANELAR_PIP = 14
-ANELAR_TIP = 16
-MINDINHO_MCP = 17
-MINDINHO_PIP = 18
-MINDINHO_TIP = 20
-
-PARES_DEDOS: tuple[tuple[int, int], ...] = (
-    (INDICADOR_TIP, INDICADOR_PIP),
-    (MEDIO_TIP, MEDIO_PIP),
-    (ANELAR_TIP, ANELAR_PIP),
-    (MINDINHO_TIP, MINDINHO_PIP),
-)
-
-MAPA_NOTAS_DEDOS: dict[tuple[bool, bool, bool, bool], str | None] = {
-    (True, False, False, False): "DO",
-    (True, True, False, False): "RE",
-    (True, True, True, False): "MI",
-    (True, False, False, True): "SI",
-    (False, False, False, False): None,
-}
+LARGURA_CANVAS: int = 1280
+ALTURA_CANVAS: int = 720
+TITULO_JANELA: str = "Tocador Musical Gestual"
 
 
-def calcular_volume_por_altura(y_punho: float, vol_suave_anterior: float) -> float:
-    """Mapeia ``landmarks[0].y`` para ``[0.10, 1.00]`` com suavização EMA."""
-    y_limitado = max(Y_TOPO, min(Y_BASE, float(y_punho)))
-    fator = (Y_BASE - y_limitado) / (Y_BASE - Y_TOPO)
-    vol_bruto = VOL_MIN + fator * (VOL_MAX - VOL_MIN)
-    vol_suave = EMA_PESO_ATUAL * vol_suave_anterior + EMA_PESO_BRUTO * vol_bruto
-    return max(VOL_MIN, min(VOL_MAX, vol_suave))
+class EstabilizadorNota:
+    """Filtro temporal combinado (frames + tempo) para confirmação de notas."""
+
+    def __init__(
+        self,
+        min_frames: int = FRAMES_CONFIRMACAO_NOTA,
+        min_segundos: float = TEMPO_ESTABILIDADE_SEGUNDOS,
+    ) -> None:
+        self.min_frames = max(1, int(min_frames))
+        self.min_segundos = max(0.0, float(min_segundos))
+        self._candidato: str | None = None
+        self._contador: int = 0
+        self._inicio_candidato: float = 0.0
+        self.nota_confirmada: str | None = None
+
+    def atualizar(
+        self,
+        gesto_valido: bool,
+        nota_candidata: str | None,
+        agora: float,
+    ) -> str | None:
+        """Atualiza o buffer e retorna a nota atualmente confirmada."""
+        if not gesto_valido:
+            self._contador = 0
+            return self.nota_confirmada
+
+        if self._contador > 0 and nota_candidata == self._candidato:
+            self._contador += 1
+        else:
+            self._candidato = nota_candidata
+            self._contador = 1
+            self._inicio_candidato = agora
+
+        if (
+            self._contador >= self.min_frames
+            and (agora - self._inicio_candidato) >= self.min_segundos
+        ):
+            self.nota_confirmada = self._candidato
+
+        return self.nota_confirmada
 
 
-def _distancia_2d(lm_a: Any, lm_b: Any) -> float:
-    """Calcula a distância euclidiana normalizada 2D entre dois landmarks."""
-    return math.hypot(lm_a.x - lm_b.x, lm_a.y - lm_b.y)
+class GerenciadorTouchAereo:
+    """Detecta permanência (dwell) da ponta do indicador sobre botões da HUD."""
 
+    def __init__(
+        self,
+        tempo_dwell: float = TEMPO_DWELL_TOUCH,
+        cooldown: float = COOLDOWN_TOUCH,
+    ) -> None:
+        self.tempo_dwell = max(0.05, float(tempo_dwell))
+        self.cooldown = max(0.0, float(cooldown))
+        self._hover_id: str | None = None
+        self._hover_inicio: float = 0.0
+        self._ultimo_disparo: float = -999.0
 
-def _polegar_aberto(landmarks: Sequence[Any]) -> bool:
-    """Verifica se o polegar está estendido para fora da palma (ambidestro)."""
-    dist_ponta_mindinho = _distancia_2d(landmarks[POLEGAR_TIP], landmarks[MINDINHO_MCP])
-    dist_articulacao_mindinho = _distancia_2d(landmarks[POLEGAR_IP], landmarks[MINDINHO_MCP])
-    dist_base_mindinho = _distancia_2d(landmarks[POLEGAR_MCP], landmarks[MINDINHO_MCP])
-    return (
-        dist_ponta_mindinho > dist_articulacao_mindinho
-        and dist_ponta_mindinho > dist_base_mindinho
-    )
+    def atualizar(
+        self,
+        pontas_norm: Sequence[tuple[float, float]],
+        botoes: Sequence[BotaoUI],
+        largura: int,
+        altura: int,
+        agora: float,
+    ) -> tuple[str | None, str | None, float]:
+        """Retorna ``(acao_disparada, id_hover_atual, progresso_0_a_1)``."""
+        if not pontas_norm or not botoes or (agora - self._ultimo_disparo) < self.cooldown:
+            self._hover_id = None
+            return None, None, 0.0
 
+        alvo_id: str | None = None
+        for nx, ny in pontas_norm:
+            px = int(round(nx * largura))
+            py = int(round(ny * altura))
+            for btn in botoes:
+                if btn.contem(px, py):
+                    alvo_id = btn.id_acao
+                    break
+            if alvo_id is not None:
+                break
 
-def classificar_gesto(landmarks: Sequence[Any]) -> tuple[bool, str | None]:
-    """Classifica os 21 landmarks em uma nota musical ou silêncio."""
-    if _distancia_2d(landmarks[POLEGAR_TIP], landmarks[INDICADOR_TIP]) < LIMIAR_PINCA:
-        return True, "LA"
+        if alvo_id is None:
+            self._hover_id = None
+            return None, None, 0.0
 
-    dedos = tuple(
-        landmarks[tip].y < landmarks[pip].y
-        for tip, pip in PARES_DEDOS
-    )
+        if alvo_id != self._hover_id:
+            self._hover_id = alvo_id
+            self._hover_inicio = agora
+            return None, alvo_id, 0.0
 
-    if dedos == (True, True, True, True):
-        return True, ("SOL" if _polegar_aberto(landmarks) else "FA")
+        decorrido = agora - self._hover_inicio
+        if decorrido >= self.tempo_dwell:
+            self._ultimo_disparo = agora
+            self._hover_id = None
+            return alvo_id, None, 0.0
 
-    if dedos in MAPA_NOTAS_DEDOS:
-        return True, MAPA_NOTAS_DEDOS[dedos]
-
-    return False, None
-
-
-def contar_dedos_abertos(landmarks: Sequence[Any]) -> int:
-    """Conta quantos dedos (0 a 5) estão estendidos na mão."""
-    abertos = sum(1 for tip, pip in PARES_DEDOS if landmarks[tip].y < landmarks[pip].y)
-    if _polegar_aberto(landmarks):
-        abertos += 1
-    return abertos
-
-
-def classificar_oitava(landmarks: Sequence[Any]) -> int:
-    """Mapeia quantidade de dedos da mão esquerda para oitava (-1, 0, +1)."""
-    dedos = contar_dedos_abertos(landmarks)
-    if dedos <= 1:
-        return -1
-    if dedos <= 3:
-        return 0
-    return 1
-
-
-def separar_maos_espelhadas(
-    maos_landmarks: Sequence[Any],
-    handedness_list: Sequence[Any] | None,
-) -> tuple[Any | None, Any | None]:
-    """Retorna ``(mao_direita_real, mao_esquerda_real)`` para imagem espelhada."""
-    if not maos_landmarks:
-        return None, None
-
-    if len(maos_landmarks) == 1:
-        rotulo = (
-            handedness_list[0].classification[0].label
-            if handedness_list and handedness_list[0].classification
-            else "Left"
-        )
-        # Em imagem espelhada (cv2.flip), "Left" do MediaPipe é a mão direita real
-        if rotulo == "Left":
-            return maos_landmarks[0], None
-        return None, maos_landmarks[0]
-
-    candidatos = []
-    for idx, hand_lm in enumerate(maos_landmarks[:2]):
-        rotulo = (
-            handedness_list[idx].classification[0].label
-            if handedness_list and idx < len(handedness_list) and handedness_list[idx].classification
-            else ""
-        )
-        candidatos.append((rotulo, hand_lm))
-
-    mao_dir = next((lm for rot, lm in candidatos if rot == "Left"), None)
-    mao_esq = next((lm for rot, lm in candidatos if rot == "Right"), None)
-
-    if mao_dir is None or mao_esq is None:
-        ordenado = sorted(maos_landmarks[:2], key=lambda h: h.landmark[PUNHO].x)
-        mao_esq, mao_dir = ordenado[0], ordenado[1]
-
-    return mao_dir, mao_esq
-
-
-def _cor_vu_meter(nivel: float) -> tuple[int, int, int]:
-    """Interpola cor BGR de verde -> amarelo -> vermelho conforme o nível [0.1, 1.0]."""
-    progresso = max(0.0, min(1.0, (nivel - VOL_MIN) / (VOL_MAX - VOL_MIN)))
-    if progresso < 0.5:
-        t = progresso * 2.0
-        b = int(60 * (1.0 - t))
-        g = int(220 + 5 * t)
-        r = int(60 + 195 * t)
-    else:
-        t = (progresso - 0.5) * 2.0
-        b = int(50 * t)
-        g = int(225 * (1.0 - t) + 60 * t)
-        r = int(255 - 10 * t)
-    return (b, g, r)
-
-
-def desenhar_hud(
-    frame: np.ndarray,
-    nota_atual: str | None,
-    volume: float,
-    mao_detectada: bool,
-    timbre: str = "theremin",
-    oitava: int = 0,
-    modo_duas_maos: bool = False,
-    trilha_notas: Sequence[str] = (),
-) -> None:
-    """Renderiza painel superior, trilha de notas e VU Meter vertical."""
-    altura, largura = frame.shape[:2]
-
-    altura_painel = 86
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (largura, altura_painel), (18, 20, 28), -1)
-    cv2.addWeighted(overlay, 0.74, frame, 0.26, 0, frame)
-    cv2.line(frame, (0, altura_painel), (largura, altura_painel), (70, 80, 100), 1)
-
-    nome_nota = nota_atual if nota_atual is not None else "SILENCIO"
-    freq = (
-        audio_engine.NOTAS_FREQUENCIAS[nota_atual] * (2.0 ** oitava)
-        if nota_atual in audio_engine.NOTAS_FREQUENCIAS
-        else None
-    )
-    texto_freq = f"{freq:.2f} Hz" if freq is not None else "-- Hz"
-    percentual = int(round(volume * 100))
-
-    cor_nota = (80, 235, 140) if nota_atual is not None else (160, 165, 180)
-    cor_status = (60, 220, 90) if mao_detectada else (0, 175, 255)
-
-    cv2.circle(frame, (22, 43), 8, cor_status, -1)
-    cv2.putText(frame, "NOTA", (42, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (175, 185, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, nome_nota, (42, 62), cv2.FONT_HERSHEY_SIMPLEX, 1.05, cor_nota, 2, cv2.LINE_AA)
-
-    x_freq = int(largura * 0.28)
-    cv2.putText(frame, "FREQUENCIA", (x_freq, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (175, 185, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, texto_freq, (x_freq, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (240, 244, 250), 2, cv2.LINE_AA)
-
-    x_cfg = int(largura * 0.54)
-    nome_timbre = audio_engine.NOMES_TIMBRES.get(timbre, timbre)
-    texto_oitava = f"{oitava:+d}" if oitava != 0 else "0"
-    texto_modo = "2 MAOS" if modo_duas_maos else "1 MAO"
-    cv2.putText(frame, f"TIMBRE | {texto_modo}", (x_cfg, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (175, 185, 200), 1, cv2.LINE_AA)
-    cv2.putText(
-        frame,
-        f"{nome_timbre} (8va {texto_oitava})",
-        (x_cfg, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.58,
-        (255, 215, 110),
-        2,
-        cv2.LINE_AA,
-    )
-
-    x_vol = int(largura * 0.82)
-    cor_vol = _cor_vu_meter(volume)
-    cv2.putText(frame, "VOLUME", (x_vol, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (175, 185, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"{percentual:3d}%", (x_vol, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.92, cor_vol, 2, cv2.LINE_AA)
-
-    # Barra vertical VU Meter na lateral direita
-    vu_largura = 30
-    vu_x2 = largura - 20
-    vu_x1 = vu_x2 - vu_largura
-    vu_y1 = altura_painel + 34
-    vu_y2 = altura - 66
-
-    overlay_vu = frame.copy()
-    cv2.rectangle(overlay_vu, (vu_x1 - 12, vu_y1 - 24), (vu_x2 + 10, vu_y2 + 26), (18, 20, 28), -1)
-    cv2.addWeighted(overlay_vu, 0.65, frame, 0.35, 0, frame)
-
-    cv2.putText(frame, "VOL", (vu_x1 - 2, vu_y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (210, 218, 230), 1, cv2.LINE_AA)
-    cv2.rectangle(frame, (vu_x1, vu_y1), (vu_x2, vu_y2), (45, 50, 62), -1)
-
-    altura_barra = vu_y2 - vu_y1
-    progresso = max(0.0, min(1.0, (volume - VOL_MIN) / (VOL_MAX - VOL_MIN)))
-    altura_preenchida = int(round(altura_barra * (0.10 + 0.90 * progresso)))
-    topo_preenchido = vu_y2 - altura_preenchida
-
-    num_segmentos = 22
-    espaco = 2
-    alt_seg = max(2, (altura_barra - (num_segmentos - 1) * espaco) // num_segmentos)
-    for idx in range(num_segmentos):
-        seg_y2 = vu_y2 - idx * (alt_seg + espaco)
-        seg_y1 = max(vu_y1, seg_y2 - alt_seg)
-        if seg_y2 <= topo_preenchido:
-            continue
-        nivel_seg = VOL_MIN + (idx / max(1, num_segmentos - 1)) * (VOL_MAX - VOL_MIN)
-        cv2.rectangle(frame, (vu_x1 + 3, seg_y1), (vu_x2 - 3, seg_y2), _cor_vu_meter(nivel_seg), -1)
-
-    cv2.rectangle(frame, (vu_x1, vu_y1), (vu_x2, vu_y2), (130, 140, 160), 1)
-    cv2.putText(frame, f"{percentual}%", (vu_x1 - 4, vu_y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, cor_vol, 1, cv2.LINE_AA)
-
-    # Trilha visual das últimas notas tocadas
-    if trilha_notas:
-        trilha_str = "Trilha: " + " -> ".join(trilha_notas)
-        cv2.putText(frame, trilha_str, (16, altura - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (125, 225, 255), 1, cv2.LINE_AA)
-
-    cv2.putText(
-        frame,
-        "1-3: Timbre | M: Modo 2 Maos | C: Limpar Trilha | ESC/Q: Sair",
-        (16, altura - 14),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.47,
-        (210, 215, 225),
-        1,
-        cv2.LINE_AA,
-    )
+        return None, alvo_id, max(0.0, min(1.0, decorrido / self.tempo_dwell))
 
 
 def executar() -> None:
-    """Executa o loop principal de captura de vídeo, detecção e síntese sonora."""
+    """Executa o loop principal HD não-bloqueante com áudio, arpejador e HUD."""
     audio_engine.inicializar_audio()
-    avaliador = AvaliadorMusical()
-    memes = GerenciadorMemes()
+    rastreador = RastreadorMaos()
+    estabilizador = EstabilizadorNota()
+    touch_aereo = GerenciadorTouchAereo()
+    looper = MiniLooper()
+    memes = SistemaParticulasMemes()
 
     captura = cv2.VideoCapture(0)
     if not captura.isOpened():
+        audio_engine.encerrar_audio()
         raise RuntimeError(
             "Não foi possível acessar a webcam (índice 0). "
             "Verifique se a câmera está conectada e livre para uso."
         )
 
-    mp_hands = mp.solutions.hands
-    mp_desenho = mp.solutions.drawing_utils
-    mp_estilos = mp.solutions.drawing_styles
+    captura.set(cv2.CAP_PROP_FRAME_WIDTH, LARGURA_CANVAS)
+    captura.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTURA_CANVAS)
 
-    vol_suave = 0.55
-    nota_atual: str | None = None
-    candidato_estado: str | None = None
-    contador_debounce: int = 0
-    modo_duas_maos = False
+    cv2.namedWindow(TITULO_JANELA, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(TITULO_JANELA, LARGURA_CANVAS, ALTURA_CANVAS)
+
+    clique_mouse: list[tuple[int, int] | None] = [None]
+
+    def _on_mouse(evento: int, x: int, y: int, _flags: int, _param: object) -> None:
+        if evento == cv2.EVENT_LBUTTONDOWN:
+            clique_mouse[0] = (x, y)
+
+    cv2.setMouseCallback(TITULO_JANELA, _on_mouse)
+
+    mp_hands = mp.solutions.hands
+
+    nota_tocando: str | None = None
+    escala_tocando: TipoEscala = "maior"
+    arpejo_tocando: bool = False
+    passo_arpejo: int = 0
+    ultimo_pulso_arpejo: float = 0.0
+    proximo_pulso_arpejo: float = 0.0
+
+    mostrar_guia: bool = False
+    tela_cheia: bool = False
+    botoes_ui: list[BotaoUI] = []
+
+    def _executar_acao_ui(acao: str, agora_ev: float, vol_ev: float, arp_ev: bool) -> None:
+        nonlocal mostrar_guia
+        if acao.startswith("timbre:"):
+            indice = int(acao.split(":")[1])
+            audio_engine.definir_timbre(indice)
+        elif acao == "looper:toggle":
+            tim_atual, _ = audio_engine.obter_estado_audio()
+            looper.alternar(
+                agora_ev,
+                nota_atual=nota_tocando,
+                escala_atual=escala_tocando,
+                timbre_atual=tim_atual,
+                volume_atual=vol_ev,
+                arpejo_atual=arp_ev,
+            )
+        elif acao == "ajuda:toggle":
+            mostrar_guia = not mostrar_guia
 
     try:
         with mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.75,
-            min_tracking_confidence=0.75,
+            model_complexity=1,
+            min_detection_confidence=0.72,
+            min_tracking_confidence=0.72,
         ) as hands:
             while True:
                 sucesso, frame = captura.read()
                 if not sucesso:
                     break
 
+                agora = time.perf_counter()
+
                 frame = cv2.flip(frame, 1)
+                if frame.shape[1] < LARGURA_CANVAS or frame.shape[0] < ALTURA_CANVAS:
+                    frame = cv2.resize(frame, (LARGURA_CANVAS, ALTURA_CANVAS), interpolation=cv2.INTER_LINEAR)
+
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_rgb.flags.writeable = False
                 resultado = hands.process(frame_rgb)
                 frame_rgb.flags.writeable = True
 
-                maos = resultado.multi_hand_landmarks or []
-                mao_detectada = len(maos) > 0
-                for hand_lm in maos:
-                    mp_desenho.draw_landmarks(
-                        frame,
-                        hand_lm,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_estilos.get_default_hand_landmarks_style(),
-                        mp_estilos.get_default_hand_connections_style(),
-                    )
-
-                estado_valido = False
-                proximo_estado: str | None = None
-
-                if mao_detectada:
-                    if modo_duas_maos:
-                        mao_dir, mao_esq = separar_maos_espelhadas(maos, resultado.multi_handedness)
-                        if mao_esq is not None:
-                            vol_suave = calcular_volume_por_altura(mao_esq.landmark[PUNHO].y, vol_suave)
-                            audio_engine.atualizar_volume(vol_suave)
-                            audio_engine.definir_oitava(classificar_oitava(mao_esq.landmark))
-                        if mao_dir is not None:
-                            estado_valido, proximo_estado = classificar_gesto(mao_dir.landmark)
-                        else:
-                            estado_valido, proximo_estado = True, None
-                    else:
-                        landmarks = maos[0].landmark
-                        vol_suave = calcular_volume_por_altura(landmarks[PUNHO].y, vol_suave)
-                        audio_engine.atualizar_volume(vol_suave)
-                        estado_valido, proximo_estado = classificar_gesto(landmarks)
-                else:
-                    estado_valido = True
-                    proximo_estado = None
-
-                if estado_valido:
-                    if proximo_estado == candidato_estado:
-                        contador_debounce += 1
-                    else:
-                        candidato_estado = proximo_estado
-                        contador_debounce = 1
-
-                    if contador_debounce >= FRAMES_CONFIRMACAO and candidato_estado != nota_atual:
-                        nota_atual = candidato_estado
-                        if nota_atual is None:
-                            audio_engine.parar_nota()
-                        else:
-                            audio_engine.tocar_nota(nota_atual, vol_suave)
-                            avaliacao = avaliador.registrar_nota(nota_atual)
-                            if avaliacao is not None and avaliacao.categoria is not None:
-                                memes.ativar(avaliacao.categoria, avaliacao.motivo)
-                                audio_engine.tocar_sfx_meme(avaliacao.categoria)
-
-                timbre_atual, oitava_atual = audio_engine.obter_estado_audio()
-                desenhar_hud(
-                    frame,
-                    nota_atual,
-                    vol_suave,
-                    mao_detectada,
-                    timbre=timbre_atual,
-                    oitava=oitava_atual,
-                    modo_duas_maos=modo_duas_maos,
-                    trilha_notas=avaliador.historico,
+                maos_detectadas = resultado.multi_hand_landmarks or []
+                estado_maos = rastreador.processar(
+                    maos_detectadas,
+                    resultado.multi_handedness,
+                    agora=agora,
                 )
-                memes.renderizar(frame)
-                cv2.imshow("Theremin Gestual - Dó Maior", frame)
+
+                # Processa cliques do mouse ou Touch Aéreo nos botões da barra superior
+                if clique_mouse[0] is not None:
+                    mx, my = clique_mouse[0]
+                    clique_mouse[0] = None
+                    for btn in botoes_ui:
+                        if btn.contem(mx, my):
+                            _executar_acao_ui(btn.id_acao, agora, estado_maos.volume, estado_maos.arpejo_ativo)
+                            break
+
+                acao_touch, hover_id, prog_hover = touch_aereo.atualizar(
+                    estado_maos.pontas_indicadores,
+                    botoes_ui,
+                    frame.shape[1],
+                    frame.shape[0],
+                    agora,
+                )
+                if acao_touch is not None:
+                    _executar_acao_ui(acao_touch, agora, estado_maos.volume, estado_maos.arpejo_ativo)
+
+                nota_confirmada = estabilizador.atualizar(
+                    estado_maos.gesto_valido,
+                    estado_maos.nota_candidata,
+                    agora,
+                )
+
+                timbre_atual, modo_harmonico_atual = audio_engine.obter_estado_audio()
+
+                if nota_confirmada is not None:
+                    mudou_nota = nota_confirmada != nota_tocando
+                    mudou_escala = estado_maos.escala != escala_tocando
+                    mudou_modo_arp = estado_maos.arpejo_ativo != arpejo_tocando
+
+                    if estado_maos.arpejo_ativo:
+                        if mudou_nota or mudou_escala or mudou_modo_arp:
+                            audio_engine.tocar_nota(
+                                nota_confirmada,
+                                escala=estado_maos.escala,
+                                volume=estado_maos.volume,
+                                arpejo=True,
+                            )
+                            passo_arpejo = 0
+                            proximo_pulso_arpejo = agora
+                            if mudou_nota or mudou_escala:
+                                memes.disparar(
+                                    estado_maos.escala,
+                                    posicao_norm=estado_maos.ancora_meme,
+                                    rotulo=f"{nota_confirmada} {estado_maos.escala.upper()}",
+                                    agora=agora,
+                                )
+                            nota_tocando = nota_confirmada
+                            escala_tocando = estado_maos.escala
+                            arpejo_tocando = True
+
+                        if agora >= proximo_pulso_arpejo:
+                            passo_usado = passo_arpejo
+                            passo_arpejo = audio_engine.disparar_passo_arpejo(
+                                nota_confirmada,
+                                escala=estado_maos.escala,
+                                passo=passo_usado,
+                                volume=estado_maos.volume,
+                            )
+                            looper.registrar_passo_arpejo(
+                                nota_confirmada,
+                                estado_maos.escala,
+                                timbre_atual,
+                                passo_usado,
+                                estado_maos.volume,
+                                agora,
+                            )
+                            ultimo_pulso_arpejo = agora
+                            proximo_pulso_arpejo = agora + (1.0 / max(1.0, estado_maos.taxa_arpejo_hz))
+                    else:
+                        if mudou_nota or mudou_escala or mudou_modo_arp:
+                            audio_engine.tocar_nota(
+                                nota_confirmada,
+                                escala=estado_maos.escala,
+                                volume=estado_maos.volume,
+                                arpejo=False,
+                            )
+                            looper.registrar_nota(
+                                nota_confirmada,
+                                estado_maos.escala,
+                                timbre_atual,
+                                estado_maos.volume,
+                                agora,
+                            )
+                            if mudou_nota or mudou_escala:
+                                memes.disparar(
+                                    estado_maos.escala,
+                                    posicao_norm=estado_maos.ancora_meme,
+                                    rotulo=f"{nota_confirmada} {estado_maos.escala.upper()}",
+                                    agora=agora,
+                                )
+                            nota_tocando = nota_confirmada
+                            escala_tocando = estado_maos.escala
+                            arpejo_tocando = False
+                        else:
+                            audio_engine.atualizar_volume(estado_maos.volume)
+                else:
+                    if nota_tocando is not None:
+                        audio_engine.parar_nota()
+                        looper.registrar_parada(agora)
+                        nota_tocando = None
+                        arpejo_tocando = False
+
+                looper.atualizar(agora)
+
+                ui_renderer.desenhar_maos(frame, estado_maos.maos_visuais)
+                if estado_maos.modo_duas_maos and estado_maos.arpejo_ativo:
+                    ui_renderer.desenhar_corda_arpejo(
+                        frame,
+                        estado_maos.ponto_palma_esq,
+                        estado_maos.ponto_palma_dir,
+                        estado_maos.escala,
+                        nota_tocando,
+                        agora - ultimo_pulso_arpejo,
+                        agora,
+                    )
+                memes.atualizar_e_renderizar(frame, agora=agora)
+
+                botoes_ui = ui_renderer.desenhar_hud(
+                    frame,
+                    estado_maos=estado_maos,
+                    nota_ativa=nota_tocando,
+                    timbre=timbre_atual,
+                    modo_harmonico=modo_harmonico_atual,
+                    looper_estado=looper.estado,
+                    looper_progresso=looper.obter_progresso(agora),
+                    mostrar_guia=mostrar_guia,
+                    botao_hover_id=hover_id,
+                    progresso_hover=prog_hover,
+                )
+
+                cv2.imshow(TITULO_JANELA, frame)
 
                 tecla = cv2.waitKey(1) & 0xFF
                 if tecla in (27, ord("q"), ord("Q")):
                     break
-                if tecla in (ord("1"), ord("2"), ord("3")):
+                if tecla in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
                     audio_engine.definir_timbre(tecla - ord("0"))
-                elif tecla in (ord("m"), ord("M")):
-                    modo_duas_maos = not modo_duas_maos
-                    if not modo_duas_maos:
-                        audio_engine.definir_oitava(0)
-                elif tecla in (ord("c"), ord("C")):
-                    avaliador.limpar()
+                elif tecla in (ord("h"), ord("H")):
+                    audio_engine.alternar_modo_harmonico()
+                elif tecla in (ord("g"), ord("G")):
+                    mostrar_guia = not mostrar_guia
+                elif tecla in (ord("r"), ord("R")):
+                    _executar_acao_ui("looper:toggle", agora, estado_maos.volume, estado_maos.arpejo_ativo)
+                elif tecla in (ord("f"), ord("F")):
+                    tela_cheia = not tela_cheia
+                    cv2.setWindowProperty(
+                        TITULO_JANELA,
+                        cv2.WND_PROP_FULLSCREEN,
+                        cv2.WINDOW_FULLSCREEN if tela_cheia else cv2.WINDOW_NORMAL,
+                    )
     finally:
+        looper.parar()
         captura.release()
         cv2.destroyAllWindows()
         audio_engine.encerrar_audio()
