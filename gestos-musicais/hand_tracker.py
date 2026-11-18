@@ -36,6 +36,8 @@ LIMIAR_FECHAR_POLEGAR: float = 0.02
 LIMIAR_MEDIO_POLEGAR: float = 0.06
 
 FRAMES_CONFIRMACAO_ESCALA_DIR: int = 3
+# Frames tolerados caso o MediaPipe perca a mão por movimento rápido (anti-piscada).
+FRAMES_MEMORIA_PERDA_MAO: int = 2
 
 # ---------------------------------------------------------------------------
 # Parâmetros de Mapeamento de Volume, Suavização e Arpejador Espacial
@@ -288,6 +290,8 @@ class RastreadorMaos:
         self._dedos_esq_anterior: EstadoDedos | None = None
         self._dedos_dir_anterior: EstadoDedos | None = None
         self._dedos_unica_anterior: EstadoDedos | None = None
+        self._ultimo_estado_valido: EstadoMaos | None = None
+        self._frames_sem_mao: int = 0
 
     def _suavizar_pontos(self, papel: PapelMao, pontos_brutos: np.ndarray) -> np.ndarray:
         anterior = self._pontos_suaves.get(papel)
@@ -309,6 +313,14 @@ class RastreadorMaos:
         num_maos = len(maos_landmarks)
 
         if num_maos == 0:
+            self._frames_sem_mao += 1
+            if (
+                self._ultimo_estado_valido is not None
+                and self._frames_sem_mao <= FRAMES_MEMORIA_PERDA_MAO
+            ):
+                return self._ultimo_estado_valido
+
+            self._ultimo_estado_valido = None
             self._arpejo_ativo = False
             self._pontos_suaves.clear()
             self._dedos_esq_anterior = None
@@ -333,6 +345,8 @@ class RastreadorMaos:
                 pontas_indicadores=[],
                 maos_visuais=[],
             )
+
+        self._frames_sem_mao = 0
 
         # Modo simplificado com 1 mão: toca DO4..DO5 no Modo Maior padrão
         if num_maos == 1:
@@ -364,7 +378,7 @@ class RastreadorMaos:
                 postura_direita="aberta",
                 volume=VOLUME_PADRAO_1_MAO,
             )
-            return EstadoMaos(
+            estado = EstadoMaos(
                 modo_duas_maos=False,
                 num_maos=1,
                 nota_candidata=nota,
@@ -380,6 +394,8 @@ class RastreadorMaos:
                 pontas_indicadores=[ponta_ind],
                 maos_visuais=[mao_visual],
             )
+            self._ultimo_estado_valido = estado
+            return estado
 
         # Modo expressivo com 2 mãos:
         # - Mão Esquerda: nota (DO4..DO5 ou Silêncio)
@@ -459,7 +475,7 @@ class RastreadorMaos:
             volume=self._volume_suave,
         )
 
-        return EstadoMaos(
+        estado = EstadoMaos(
             modo_duas_maos=True,
             num_maos=num_maos,
             nota_candidata=nota,
@@ -475,3 +491,5 @@ class RastreadorMaos:
             pontas_indicadores=pontas_ind,
             maos_visuais=[mao_esq_visual, mao_dir_visual],
         )
+        self._ultimo_estado_valido = estado
+        return estado

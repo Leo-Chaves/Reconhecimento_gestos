@@ -230,20 +230,41 @@ class TestHandTracker(unittest.TestCase):
         self.assertAlmostEqual(estado_1.volume, VOLUME_PADRAO_1_MAO, places=4)
         self.assertFalse(estado_1.arpejo_ativo)
 
+    def test_memoria_anti_piscada_dois_frames(self) -> None:
+        rastreador = RastreadorMaos()
+        mao = _criar_mao_sintetica((True, True, False, False), lado="esquerda", centro_x=0.30)
+        handed = [_FakeHandedness([_FakeClassificacao("Left")])]
+
+        est_ok = rastreador.processar([mao], handed)
+        self.assertEqual(est_ok.nota_candidata, "RE4")
+
+        # 1º e 2º frames sem mão devem preservar o último estado válido
+        est_piscada_1 = rastreador.processar([], [])
+        est_piscada_2 = rastreador.processar([], [])
+        self.assertEqual(est_piscada_1.nota_candidata, "RE4")
+        self.assertEqual(est_piscada_2.nota_candidata, "RE4")
+
+        # 3º frame consecutivo sem mão entra em silêncio real
+        est_silencio = rastreador.processar([], [])
+        self.assertEqual(est_silencio.num_maos, 0)
+        self.assertIsNone(est_silencio.nota_candidata)
+
 
 class TestEstabilizadorETouchAereo(unittest.TestCase):
     """Testes do debounce de notas e do dwell do Touch Aéreo na HUD."""
 
     def test_debounce_frames_e_tempo_e_transicao_invalida(self) -> None:
-        estab = EstabilizadorNota(min_frames=5, min_segundos=0.095)
-        for i in range(4):
-            self.assertIsNone(estab.atualizar(True, "DO4", agora=1.00 + i * 0.03))
-        self.assertEqual(estab.atualizar(True, "DO4", agora=1.12), "DO4")
-        self.assertEqual(estab.atualizar(False, None, agora=1.15), "DO4")
-        for i in range(3):
-            self.assertEqual(estab.atualizar(True, "SOL4", agora=1.18 + i * 0.02), "DO4")
-        estab.atualizar(True, "SOL4", agora=1.25)
-        self.assertEqual(estab.atualizar(True, "SOL4", agora=1.29), "SOL4")
+        estab = EstabilizadorNota(min_frames=3, min_segundos=0.055)
+        self.assertIsNone(estab.atualizar(True, "DO4", agora=1.00))
+        self.assertIsNone(estab.atualizar(True, "DO4", agora=1.03))
+        self.assertEqual(estab.atualizar(True, "DO4", agora=1.06), "DO4")
+
+        # Estado transitório inválido mantém DO4 e reinicia contagem do próximo candidato
+        self.assertEqual(estab.atualizar(False, None, agora=1.09), "DO4")
+
+        self.assertEqual(estab.atualizar(True, "SOL4", agora=1.12), "DO4")
+        self.assertEqual(estab.atualizar(True, "SOL4", agora=1.15), "DO4")
+        self.assertEqual(estab.atualizar(True, "SOL4", agora=1.18), "SOL4")
 
     def test_touch_aereo_dwell_e_cooldown(self) -> None:
         touch = GerenciadorTouchAereo(tempo_dwell=0.40, cooldown=0.70)
@@ -301,6 +322,13 @@ class TestAudioEngine(unittest.TestCase):
             p1 = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=0, volume=0.8)
             p2 = audio_engine.disparar_passo_arpejo("DO4", escala="maior", passo=p1, volume=0.8)
             self.assertEqual((p1, p2), (1, 2))
+
+        # Passagem fluida (Legato Maior -> Menor na mesma nota e troca de nota com release natural)
+        audio_engine.definir_timbre("piano")
+        audio_engine.tocar_nota("DO4", escala="maior", volume=0.8, arpejo=False)
+        audio_engine.tocar_nota("DO4", escala="menor", volume=0.8, arpejo=False)
+        audio_engine.tocar_nota("FA4", escala="maior", volume=0.8, arpejo=False)
+        audio_engine.atualizar_volume(0.65)
 
         # Canal do looper independente
         audio_engine.tocar_nota("SOL4", escala="menor", volume=0.5, timbre_override="violao", canal_looper=True)

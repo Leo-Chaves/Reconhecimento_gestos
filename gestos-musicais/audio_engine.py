@@ -28,6 +28,31 @@ AMPLITUDE_MAXIMA: int = 12000
 FADE_IN_MS: int = 22
 FADE_OUT_MS: int = 55
 
+# Envelopes naturais por timbre (ms) para passagem suave (Legato) e cauda de Release
+FADE_IN_POR_TIMBRE_MS: dict[str, int] = {
+    "piano": 14,
+    "violao": 14,
+    "cordas": 75,
+    "synth": 22,
+    "8bit": 10,
+}
+
+RELEASE_TROCA_POR_TIMBRE_MS: dict[str, int] = {
+    "piano": 340,
+    "violao": 300,
+    "cordas": 280,
+    "synth": 220,
+    "8bit": 90,
+}
+
+RELEASE_SILENCIO_POR_TIMBRE_MS: dict[str, int] = {
+    "piano": 420,
+    "violao": 380,
+    "cordas": 360,
+    "synth": 280,
+    "8bit": 120,
+}
+
 # Escala completa de Dó4 a Dó5 (8 notas)
 NOTAS_FREQUENCIAS: dict[str, float] = {
     "DO4": 261.63,
@@ -92,12 +117,15 @@ _inicializado: bool = False
 _sons_loop: dict[tuple[str, ModoHarmonico, TipoEscala, str], pygame.mixer.Sound] = {}
 _sons_plucked: dict[tuple[str, int], pygame.mixer.Sound] = {}
 
-_canais_loop_vivo: tuple[pygame.mixer.Channel, pygame.mixer.Channel] | None = None
-_canais_loop_looper: tuple[pygame.mixer.Channel, pygame.mixer.Channel] | None = None
+_canais_loop_vivo: list[pygame.mixer.Channel] = []
+_canais_loop_looper: list[pygame.mixer.Channel] = []
 _canais_plucked_vivo: list[pygame.mixer.Channel] = []
 _canais_plucked_looper: list[pygame.mixer.Channel] = []
 
 _idx_loop_vivo: int = 0
+_idx_loop_looper: int = 0
+_canal_ativo_vivo: pygame.mixer.Channel | None = None
+_canal_ativo_looper: pygame.mixer.Channel | None = None
 _idx_loop_looper: int = 0
 _idx_plucked_vivo: int = 0
 _idx_plucked_looper: int = 0
@@ -316,7 +344,7 @@ def inicializar_audio() -> None:
             buffer=BUFFER_MIXER,
         )
 
-    pygame.mixer.set_num_channels(16)
+    pygame.mixer.set_num_channels(18)
 
     # Pré-calcula cada voz MIDI (60..80) com reverb linear circular uma única vez,
     # evitando recalcular senoides repetidas na montagem das 160 combinações.
@@ -355,13 +383,15 @@ def inicializar_audio() -> None:
         for midi in range(60, 85)
     }
 
-    _canais_loop_vivo = (pygame.mixer.Channel(0), pygame.mixer.Channel(1))
-    _canais_plucked_vivo = [pygame.mixer.Channel(i) for i in range(2, 10)]
-    _canais_loop_looper = (pygame.mixer.Channel(10), pygame.mixer.Channel(11))
-    _canais_plucked_looper = [pygame.mixer.Channel(i) for i in range(12, 16)]
+    _canais_loop_vivo = [pygame.mixer.Channel(i) for i in range(0, 4)]
+    _canais_plucked_vivo = [pygame.mixer.Channel(i) for i in range(4, 12)]
+    _canais_loop_looper = [pygame.mixer.Channel(i) for i in range(12, 14)]
+    _canais_plucked_looper = [pygame.mixer.Channel(i) for i in range(14, 18)]
 
     _idx_loop_vivo = 0
     _idx_loop_looper = 0
+    _canal_ativo_vivo = None
+    _canal_ativo_looper = None
     _idx_plucked_vivo = 0
     _idx_plucked_looper = 0
     _inicializado = True
@@ -431,7 +461,7 @@ def obter_estado_audio() -> tuple[str, ModoHarmonico]:
 
 
 def atualizar_volume(volume: float, canal_looper: bool = False) -> None:
-    """Atualiza em tempo real o volume dos canais sustentados ativos."""
+    """Atualiza em tempo real o volume do canal sustentado ativo."""
     global _volume_atual_vivo
 
     vol = _limitar_volume(volume)
@@ -441,12 +471,10 @@ def atualizar_volume(volume: float, canal_looper: bool = False) -> None:
     if not _inicializado:
         return
 
-    par = _canais_loop_looper if canal_looper else _canais_loop_vivo
-    if par is None:
-        return
-    for ch in par:
-        if ch.get_busy():
-            ch.set_volume(vol)
+    canal_ativo = _canal_ativo_looper if canal_looper else _canal_ativo_vivo
+    if canal_ativo is not None and canal_ativo.get_busy():
+        fator_sust = 0.62 if (not canal_looper and _timbre_atual in ("piano", "violao")) else 1.0
+        canal_ativo.set_volume(vol * fator_sust)
 
 
 def tocar_nota(
@@ -456,9 +484,11 @@ def tocar_nota(
     arpejo: bool = False,
     timbre_override: str | None = None,
     canal_looper: bool = False,
+    reataque: bool | None = None,
 ) -> None:
-    """Toca o acorde/nota sustentado (ou prepara o modo arpejo silencioso)."""
+    """Toca o acorde/nota sustentado com Legato e cauda de Release natural."""
     global _idx_loop_vivo, _idx_loop_looper
+    global _canal_ativo_vivo, _canal_ativo_looper
     global _nota_ativa_vivo, _escala_ativa_vivo, _arpejo_ativo_vivo, _volume_atual_vivo
 
     inicializar_audio()
@@ -473,41 +503,61 @@ def tocar_nota(
     if timbre_efetivo not in TIMBRES:
         timbre_efetivo = _timbre_atual
 
+    # Legato inteligente: alternar MAIOR <-> MENOR na mesma nota faz crossfade sem golpe seco
+    if reataque is None:
+        mesma_nota = (not canal_looper and _nota_ativa_vivo == chave and not _arpejo_ativo_vivo)
+        deve_reatacar = not mesma_nota
+    else:
+        deve_reatacar = reataque
+
     if not canal_looper:
         _nota_ativa_vivo = chave
         _escala_ativa_vivo = escala
         _arpejo_ativo_vivo = arpejo
         _volume_atual_vivo = vol
 
-    par = _canais_loop_looper if canal_looper else _canais_loop_vivo
-    if par is None:
+    pool = _canais_loop_looper if canal_looper else _canais_loop_vivo
+    if not pool:
         return
+
+    release_ms = FADE_OUT_MS if canal_looper else RELEASE_TROCA_POR_TIMBRE_MS.get(timbre_efetivo, FADE_OUT_MS)
+    fade_in_ms = FADE_IN_MS if canal_looper else FADE_IN_POR_TIMBRE_MS.get(timbre_efetivo, FADE_IN_MS)
 
     if arpejo:
-        for ch in par:
+        for ch in pool:
             if ch.get_busy():
-                ch.fadeout(FADE_OUT_MS)
+                ch.fadeout(release_ms)
+        if canal_looper:
+            _canal_ativo_looper = None
+        else:
+            _canal_ativo_vivo = None
         return
 
-    idx_atual = _idx_loop_looper if canal_looper else _idx_loop_vivo
-    ch_ant = par[idx_atual]
-    if ch_ant.get_busy():
-        ch_ant.fadeout(FADE_OUT_MS)
+    canal_ant = _canal_ativo_looper if canal_looper else _canal_ativo_vivo
+    if canal_ant is not None and canal_ant.get_busy():
+        canal_ant.fadeout(release_ms)
 
-    novo_idx = 1 - idx_atual
+    ch_novo = next((ch for ch in pool if not ch.get_busy() and ch is not canal_ant), None)
+    if ch_novo is None:
+        if canal_looper:
+            _idx_loop_looper = (_idx_loop_looper + 1) % len(pool)
+            ch_novo = pool[_idx_loop_looper]
+        else:
+            _idx_loop_vivo = (_idx_loop_vivo + 1) % len(pool)
+            ch_novo = pool[_idx_loop_vivo]
+
     if canal_looper:
-        _idx_loop_looper = novo_idx
+        _canal_ativo_looper = ch_novo
     else:
-        _idx_loop_vivo = novo_idx
+        _canal_ativo_vivo = ch_novo
 
-    ch_novo = par[novo_idx]
     som_loop = _sons_loop[(timbre_efetivo, _modo_harmonico_atual, escala, chave)]
     fator_sust = 0.62 if timbre_efetivo in ("piano", "violao") else 1.0
     ch_novo.set_volume(vol * fator_sust)
-    ch_novo.play(som_loop, loops=-1, fade_ms=FADE_IN_MS)
+    ch_novo.play(som_loop, loops=-1, fade_ms=fade_in_ms)
 
-    # Ataque percussivo inicial em Piano e Violão para maior realismo acústico
-    if timbre_efetivo in ("piano", "violao"):
+    # Ataque percussivo inicial em Piano e Violão apenas em notas novas (não no legato Maior<->Menor)
+    if deve_reatacar and timbre_efetivo in ("piano", "violao"):
         midi_base = NOTAS_MIDI_MENOR_NATURAL[chave] if (_modo_harmonico_atual == "nota" and escala == "menor") else NOTAS_MIDI[chave]
         som_atk = _sons_plucked.get((timbre_efetivo, midi_base))
         if som_atk is not None:
@@ -551,8 +601,8 @@ def disparar_passo_arpejo(
 
 
 def parar_nota(canal_looper: bool = False) -> None:
-    """Interrompe suavemente o canal sustentado (ao vivo ou do looper)."""
-    global _nota_ativa_vivo, _arpejo_ativo_vivo
+    """Aplica cauda natural de Release ao interromper a nota ou entrar em silêncio."""
+    global _nota_ativa_vivo, _arpejo_ativo_vivo, _canal_ativo_vivo, _canal_ativo_looper
 
     if not canal_looper:
         _nota_ativa_vivo = None
@@ -561,18 +611,25 @@ def parar_nota(canal_looper: bool = False) -> None:
     if not _inicializado:
         return
 
-    par = _canais_loop_looper if canal_looper else _canais_loop_vivo
-    if par is None:
+    pool = _canais_loop_looper if canal_looper else _canais_loop_vivo
+    if not pool:
         return
-    for ch in par:
+
+    release_ms = FADE_OUT_MS if canal_looper else RELEASE_SILENCIO_POR_TIMBRE_MS.get(_timbre_atual, FADE_OUT_MS)
+    for ch in pool:
         if ch.get_busy():
-            ch.fadeout(FADE_OUT_MS)
+            ch.fadeout(release_ms)
+
+    if canal_looper:
+        _canal_ativo_looper = None
+    else:
+        _canal_ativo_vivo = None
 
 
 def encerrar_audio() -> None:
     """Libera os recursos do mixer ao finalizar a aplicação."""
-    global _inicializado, _canais_loop_vivo, _canais_loop_looper
-    global _nota_ativa_vivo, _arpejo_ativo_vivo
+    global _inicializado, _nota_ativa_vivo, _arpejo_ativo_vivo
+    global _canal_ativo_vivo, _canal_ativo_looper
 
     if _inicializado and pygame.mixer.get_init() is not None:
         parar_nota(canal_looper=False)
@@ -581,10 +638,12 @@ def encerrar_audio() -> None:
 
     _sons_loop.clear()
     _sons_plucked.clear()
-    _canais_loop_vivo = None
-    _canais_loop_looper = None
+    _canais_loop_vivo.clear()
+    _canais_loop_looper.clear()
     _canais_plucked_vivo.clear()
     _canais_plucked_looper.clear()
+    _canal_ativo_vivo = None
+    _canal_ativo_looper = None
     _nota_ativa_vivo = None
     _arpejo_ativo_vivo = False
     _inicializado = False

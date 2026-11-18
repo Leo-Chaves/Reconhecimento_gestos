@@ -30,8 +30,8 @@ from ui_renderer import BotaoUI
 # ---------------------------------------------------------------------------
 # Parâmetros de Calibração: Debounce Temporal e Touch Aéreo
 # ---------------------------------------------------------------------------
-FRAMES_CONFIRMACAO_NOTA: int = 5
-TEMPO_ESTABILIDADE_SEGUNDOS: float = 0.095
+FRAMES_CONFIRMACAO_NOTA: int = 3
+TEMPO_ESTABILIDADE_SEGUNDOS: float = 0.055
 TEMPO_DWELL_TOUCH: float = 0.40
 COOLDOWN_TOUCH: float = 0.70
 
