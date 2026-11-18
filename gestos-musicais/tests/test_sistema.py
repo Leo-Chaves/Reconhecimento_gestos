@@ -23,6 +23,9 @@ import audio_engine  # noqa: E402
 from hand_tracker import (  # noqa: E402
     RastreadorMaos,
     VOLUME_PADRAO_1_MAO,
+    calcular_score_dedo,
+    calcular_score_polegar,
+    classificar_dedos_para_nota,
     classificar_escala_mao_direita,
     classificar_gesto_nota,
     detectar_dedos_com_histerese,
@@ -147,11 +150,12 @@ class TestHandTracker(unittest.TestCase):
 
     def test_histerese_dedos_normalizada_pela_palma(self) -> None:
         mao_base = _criar_mao_sintetica((True, False, False, False), polegar_aberto=False)
-        tam_palma = float(np.hypot(*(mao_base[9] - mao_base[0])))
-        dist_pip = float(np.hypot(*(mao_base[6] - mao_base[0])))
-
         mao_zona_morta = mao_base.copy()
-        mao_zona_morta[8] = [mao_base[0, 0], mao_base[0, 1] - (dist_pip + 0.11 * tam_palma)]
+        # Posiciona ponta do indicador dentro da banda de histerese (0.35 < score < 0.55)
+        mao_zona_morta[8] = [0.260, 0.483]
+        score = calcular_score_dedo(mao_zona_morta, 5, 6, 8)
+        self.assertGreater(score, 0.35)
+        self.assertLess(score, 0.55)
 
         dedos_vindo_aberto = detectar_dedos_com_histerese(
             mao_zona_morta,
@@ -163,6 +167,55 @@ class TestHandTracker(unittest.TestCase):
         )
         self.assertTrue(dedos_vindo_aberto[1])
         self.assertFalse(dedos_vindo_fechado[1])
+
+    def test_polimento_si4_la4_mindinho_curto_e_anelar_semicurvado(self) -> None:
+        for nota_esperada, ind_aberto, pol_aberto in (("SI4", True, False), ("SI4", True, True), ("LA4", False, True)):
+            mao = _criar_mao_sintetica((ind_aberto, False, False, True), polegar_aberto=pol_aberto)
+            # Mindinho anatômico 30% mais curto que os demais dedos
+            mao[18] = [mao[17, 0], mao[17, 1] - 0.036]
+            mao[19] = [mao[17, 0], mao[17, 1] - 0.062]
+            mao[20] = [mao[17, 0], mao[17, 1] - 0.088]
+            # Anelar apenas meio curvado (tendão compartilhado ao fazer Rock/Hang Loose)
+            mao[14] = [mao[13, 0], mao[13, 1] - 0.042]
+            mao[15] = [mao[13, 0], mao[13, 1] - 0.018]
+            mao[16] = [mao[13, 0], mao[13, 1] + 0.008]
+
+            for angulo in (0.0, 30.0, -30.0):
+                mao_rot = _rotacionar_mao(mao, angulo)
+                # Mesmo vindo imediatamente de SOL4 (todos abertos), deve fechar anelar e médio
+                dedos = detectar_dedos_com_histerese(mao_rot, anterior=(True, True, True, True, True))
+                self.assertEqual(classificar_dedos_para_nota(dedos), (True, nota_esperada))
+
+    def test_separacao_sol4_vs_fa4_e_histerese_polegar(self) -> None:
+        m_sol = _criar_mao_sintetica((True, True, True, True), polegar_aberto=True)
+        m_fa_fundo = _criar_mao_sintetica((True, True, True, True), polegar_aberto=False)
+
+        # Dobra leve típica de FA4 (polegar dobrado sobre a base do indicador sem cruzar até o mindinho)
+        m_fa_leve = m_sol.copy()
+        m_fa_leve[3] = [m_sol[2, 0] - 0.020, m_sol[2, 1] - 0.032]
+        m_fa_leve[4] = [m_sol[5, 0] + 0.005, m_sol[5, 1] + 0.015]
+
+        # Dobra média sobre a palma
+        m_fa_meio = m_sol.copy()
+        m_fa_meio[3] = [m_sol[2, 0] - 0.010, m_sol[2, 1] - 0.028]
+        m_fa_meio[4] = [m_sol[5, 0] + 0.025, m_sol[5, 1] + 0.025]
+
+        self.assertGreater(calcular_score_polegar(m_sol), 0.15)
+        self.assertLess(calcular_score_polegar(m_fa_leve), 0.0)
+        self.assertLess(calcular_score_polegar(m_fa_meio), 0.0)
+        self.assertLess(calcular_score_polegar(m_fa_fundo), 0.0)
+
+        # Mesmo vindo imediatamente de SOL4 (anterior=(True,...)), dobrar para FA4 fecha o polegar!
+        dedos_sol = (True, True, True, True, True)
+        for mao_fa in (m_fa_leve, m_fa_meio, m_fa_fundo):
+            dedos_fa = detectar_dedos_com_histerese(mao_fa, anterior=dedos_sol)
+            self.assertFalse(dedos_fa[0])
+            self.assertEqual(classificar_dedos_para_nota(dedos_fa), (True, "FA4"))
+
+        # E reabrir o polegar retorna com segurança para SOL4
+        dedos_volta_sol = detectar_dedos_com_histerese(m_sol, anterior=(False, True, True, True, True))
+        self.assertTrue(dedos_volta_sol[0])
+        self.assertEqual(classificar_dedos_para_nota(dedos_volta_sol), (True, "SOL4"))
 
     def test_postura_mao_direita_maior_vs_menor(self) -> None:
         mao_aberta = _criar_mao_sintetica((True, True, True, True), polegar_aberto=True, lado="direita", centro_x=0.75)

@@ -25,14 +25,17 @@ PosturaDireita = Literal["aberta", "fechada"]
 EstadoDedos = tuple[bool, bool, bool, bool, bool]
 
 # ---------------------------------------------------------------------------
-# Parâmetros de Calibração: Histerese dos Dedos (normalizada pela palma)
+# Parâmetros de Calibração: Histerese dos Dedos (escore anatômico individual)
 # ---------------------------------------------------------------------------
-LIMIAR_ABRIR_DEDO: float = 0.18
-LIMIAR_FECHAR_DEDO: float = 0.06
-LIMIAR_MEDIO_DEDO: float = 0.12
+# Combina extensão normalizada pelo segmento MCP->PIP do próprio dedo com o
+# alinhamento angular MCP->PIP->TIP, tornando mindinho e indicador equivalentes.
+LIMIAR_ABRIR_DEDO: float = 0.55
+LIMIAR_FECHAR_DEDO: float = 0.35
+LIMIAR_MEDIO_DEDO: float = 0.45
 
-LIMIAR_ABRIR_POLEGAR: float = 0.10
-LIMIAR_FECHAR_POLEGAR: float = 0.02
+# Limiares do escore composto multi-referência do polegar (separa FA4 de SOL4).
+LIMIAR_ABRIR_POLEGAR: float = 0.12
+LIMIAR_FECHAR_POLEGAR: float = 0.00
 LIMIAR_MEDIO_POLEGAR: float = 0.06
 
 FRAMES_CONFIRMACAO_ESCALA_DIR: int = 3
@@ -63,22 +66,24 @@ PUNHO = 0
 POLEGAR_MCP = 2
 POLEGAR_IP = 3
 POLEGAR_TIP = 4
+INDICADOR_MCP = 5
 INDICADOR_PIP = 6
 INDICADOR_TIP = 8
 MEDIO_MCP = 9
 MEDIO_PIP = 10
 MEDIO_TIP = 12
+ANELAR_MCP = 13
 ANELAR_PIP = 14
 ANELAR_TIP = 16
 MINDINHO_MCP = 17
 MINDINHO_PIP = 18
 MINDINHO_TIP = 20
 
-PARES_DEDOS: tuple[tuple[int, int], ...] = (
-    (INDICADOR_TIP, INDICADOR_PIP),
-    (MEDIO_TIP, MEDIO_PIP),
-    (ANELAR_TIP, ANELAR_PIP),
-    (MINDINHO_TIP, MINDINHO_PIP),
+TRIOS_DEDOS: tuple[tuple[int, int, int], ...] = (
+    (INDICADOR_MCP, INDICADOR_PIP, INDICADOR_TIP),
+    (MEDIO_MCP, MEDIO_PIP, MEDIO_TIP),
+    (ANELAR_MCP, ANELAR_PIP, ANELAR_TIP),
+    (MINDINHO_MCP, MINDINHO_PIP, MINDINHO_TIP),
 )
 
 
@@ -145,6 +150,56 @@ def _aplicar_histerese(valor: float, estava_aberto: bool | None, abrir: float, f
     return valor > abrir
 
 
+def calcular_score_polegar(pontos: np.ndarray, tam_palma: float | None = None) -> float:
+    """Calcula escore composto invariante à rotação para abertura do polegar.
+
+    Combina três referências para evitar conflito entre FA4 e SOL4:
+    1) alcance além da largura da palma ``dist(5, 17)``;
+    2) avanço da ponta além da junta IP em relação ao mindinho e ao centro da palma;
+    3) alinhamento angular da falange distal ``2 -> 3 -> 4``.
+    """
+    tam = max(1e-4, _dist_indices(pontos, PUNHO, MEDIO_MCP) if tam_palma is None else tam_palma)
+    larg_palma = max(1e-4, _dist_indices(pontos, INDICADOR_MCP, MINDINHO_MCP))
+
+    dist_tip_17 = _dist_indices(pontos, POLEGAR_TIP, MINDINHO_MCP)
+    dist_ip_17 = _dist_indices(pontos, POLEGAR_IP, MINDINHO_MCP)
+    dist_tip_9 = _dist_indices(pontos, POLEGAR_TIP, MEDIO_MCP)
+    dist_ip_9 = _dist_indices(pontos, POLEGAR_IP, MEDIO_MCP)
+
+    termo_largura = (dist_tip_17 - 1.15 * larg_palma) / larg_palma
+    termo_junta = ((dist_tip_17 - dist_ip_17) + 0.60 * (dist_tip_9 - dist_ip_9)) / tam
+
+    vax = float(pontos[POLEGAR_IP, 0] - pontos[POLEGAR_MCP, 0])
+    vay = float(pontos[POLEGAR_IP, 1] - pontos[POLEGAR_MCP, 1])
+    vbx = float(pontos[POLEGAR_TIP, 0] - pontos[POLEGAR_IP, 0])
+    vby = float(pontos[POLEGAR_TIP, 1] - pontos[POLEGAR_IP, 1])
+    norma = math.hypot(vax, vay) * math.hypot(vbx, vby)
+    cos_falange = (vax * vbx + vay * vby) / norma if norma > 1e-6 else 0.0
+    termo_angulo = 0.25 * (cos_falange - 0.65)
+
+    return 0.45 * termo_largura + 0.45 * termo_junta + termo_angulo
+
+
+def calcular_score_dedo(pontos: np.ndarray, mcp: int, pip: int, tip: int) -> float:
+    """Calcula escore anatômico individual para extensão de um dedo principal.
+
+    Normaliza o ganho radial pelo comprimento proximal ``dist(mcp, pip)`` do
+    próprio dedo (evitando prejudicar dedos curtos como o mindinho em SI4/LA4)
+    e soma o alinhamento angular na junta ``pip`` para rejeitar dedos curvados.
+    """
+    comp_proximal = max(1e-4, _dist_indices(pontos, mcp, pip))
+    ext_relativa = (_dist_indices(pontos, PUNHO, tip) - _dist_indices(pontos, PUNHO, pip)) / comp_proximal
+
+    v1x = float(pontos[pip, 0] - pontos[mcp, 0])
+    v1y = float(pontos[pip, 1] - pontos[mcp, 1])
+    v2x = float(pontos[tip, 0] - pontos[pip, 0])
+    v2y = float(pontos[tip, 1] - pontos[pip, 1])
+    norma = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
+    cos_pip = (v1x * v2x + v1y * v2y) / norma if norma > 1e-6 else 0.0
+
+    return 0.55 * ext_relativa + 0.45 * cos_pip
+
+
 def detectar_dedos_com_histerese(
     landmarks: Sequence[Any] | np.ndarray,
     anterior: EstadoDedos | None = None,
@@ -153,13 +208,9 @@ def detectar_dedos_com_histerese(
     pontos = landmarks if isinstance(landmarks, np.ndarray) else landmarks_para_array(landmarks)
     tam_palma = max(1e-4, _dist_indices(pontos, PUNHO, MEDIO_MCP))
 
-    ref_pol = max(
-        _dist_indices(pontos, POLEGAR_IP, MINDINHO_MCP),
-        _dist_indices(pontos, POLEGAR_MCP, MINDINHO_MCP),
-    )
-    ext_pol = (_dist_indices(pontos, POLEGAR_TIP, MINDINHO_MCP) - ref_pol) / tam_palma
+    score_pol = calcular_score_polegar(pontos, tam_palma)
     pol = _aplicar_histerese(
-        ext_pol,
+        score_pol,
         None if anterior is None else anterior[0],
         LIMIAR_ABRIR_POLEGAR,
         LIMIAR_FECHAR_POLEGAR,
@@ -167,11 +218,11 @@ def detectar_dedos_com_histerese(
     )
 
     dedos_principais: list[bool] = []
-    for idx, (tip, pip) in enumerate(PARES_DEDOS):
-        ext = (_dist_indices(pontos, PUNHO, tip) - _dist_indices(pontos, PUNHO, pip)) / tam_palma
+    for idx, (mcp, pip, tip) in enumerate(TRIOS_DEDOS):
+        score_dedo = calcular_score_dedo(pontos, mcp, pip, tip)
         estado_ant = None if anterior is None else anterior[idx + 1]
         dedos_principais.append(
-            _aplicar_histerese(ext, estado_ant, LIMIAR_ABRIR_DEDO, LIMIAR_FECHAR_DEDO, LIMIAR_MEDIO_DEDO)
+            _aplicar_histerese(score_dedo, estado_ant, LIMIAR_ABRIR_DEDO, LIMIAR_FECHAR_DEDO, LIMIAR_MEDIO_DEDO)
         )
 
     return (pol, dedos_principais[0], dedos_principais[1], dedos_principais[2], dedos_principais[3])
